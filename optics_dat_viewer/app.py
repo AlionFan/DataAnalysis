@@ -9,19 +9,34 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dat_parser import DatGrid, dat_to_csv_bytes, load_dat_from_path, load_dat_from_upload
-from processing import (
-    PeakResult,
-    compute_quality_report,
-    crop_roi_2d,
-    detect_peaks_with_fwhm,
-    extract_profile,
-    fit_gaussian,
-    integrate_range,
-    normalize_minmax,
-    radial_bin_stats,
-    smooth_signal,
-)
+try:
+    from .dat_parser import DatGrid, dat_to_csv_bytes, load_dat_from_path, load_dat_from_upload
+    from .processing import (
+        PeakResult,
+        compute_quality_report,
+        crop_roi_2d,
+        detect_peaks_with_fwhm,
+        extract_profile,
+        fit_gaussian,
+        integrate_range,
+        normalize_minmax,
+        radial_bin_stats,
+        smooth_signal,
+    )
+except ImportError:
+    from dat_parser import DatGrid, dat_to_csv_bytes, load_dat_from_path, load_dat_from_upload
+    from processing import (
+        PeakResult,
+        compute_quality_report,
+        crop_roi_2d,
+        detect_peaks_with_fwhm,
+        extract_profile,
+        fit_gaussian,
+        integrate_range,
+        normalize_minmax,
+        radial_bin_stats,
+        smooth_signal,
+    )
 
 st.set_page_config(page_title="Optical DAT Viewer", layout="wide")
 st.title("光学 .dat 可视化与分析工具")
