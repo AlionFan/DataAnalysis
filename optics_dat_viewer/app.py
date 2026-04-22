@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from io import BytesIO
-import base64
 import json
 from pathlib import Path
 
@@ -410,30 +409,20 @@ def call_siliconflow_llm(
     model: str,
     system_prompt: str,
     user_prompt: str,
-    excel_bytes: bytes | None = None,
+    excel_text: str | None = None,
 ) -> str:
     if OpenAI is None:
         return "当前环境未安装 openai 依赖，请先安装 requirements。"
     try:
         client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
-        user_content: str | list = user_prompt
-        if excel_bytes:
-            b64 = base64.b64encode(excel_bytes).decode("utf-8")
-            user_content = [
-                {
-                    "type": "file",
-                    "file": {
-                        "filename": "optics_data.xlsx",
-                        "file_data": f"data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}",
-                    },
-                },
-                {"type": "text", "text": user_prompt},
-            ]
+        full_prompt = user_prompt
+        if excel_text:
+            full_prompt += f"\n\n--- 数据附件（CSV 格式） ---\n{excel_text}"
         resp = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
+                {"role": "user", "content": full_prompt},
             ],
             temperature=0.3,
         )
@@ -913,18 +902,23 @@ def main() -> None:
                 st.error("请先输入 API Key")
             else:
                 with st.spinner("模型分析中..."):
-                    excel_buffer = BytesIO()
-                    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-                        quality_df.to_excel(writer, sheet_name="质量诊断", index=False)
-                        roi_df.to_excel(writer, sheet_name="ROI统计", index=False)
-                        radial_df.to_excel(writer, sheet_name="径向统计", index=False)
-                        pd.DataFrame(cropped_grid.data).to_excel(writer, sheet_name="ROI数据", index=False)
-                        if not peak_export.empty:
-                            peak_export.to_excel(writer, sheet_name="峰值分析", index=False)
-                        if not batch_df.empty:
-                            batch_df.to_excel(writer, sheet_name="批处理汇总", index=False)
-                    excel_bytes = excel_buffer.getvalue()
-                    result = call_siliconflow_llm(api_key.strip(), model, system_prompt, user_prompt, excel_bytes=excel_bytes)
+                    parts = []
+                    parts.append("=== 质量诊断 ===")
+                    parts.append(quality_df.to_csv(index=False))
+                    parts.append("\n=== ROI 统计 ===")
+                    parts.append(roi_df.to_csv(index=False))
+                    parts.append("\n=== 径向统计（前20行） ===")
+                    parts.append(radial_df.head(20).to_csv(index=False))
+                    parts.append("\n=== ROI 数据矩阵 ===")
+                    parts.append(pd.DataFrame(cropped_grid.data).to_csv(index=False))
+                    if not peak_export.empty:
+                        parts.append("\n=== 峰值分析 ===")
+                        parts.append(peak_export.to_csv(index=False))
+                    if not batch_df.empty:
+                        parts.append("\n=== 批处理汇总 ===")
+                        parts.append(batch_df.head(20).to_csv(index=False))
+                    excel_text = "\n".join(parts)
+                    result = call_siliconflow_llm(api_key.strip(), model, system_prompt, user_prompt, excel_text=excel_text)
                 st.text_area("模型分析结果", value=result, height=300)
 
 
