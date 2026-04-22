@@ -1,437 +1,369 @@
 from __future__ import annotations
 
-from io import BytesIO
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
 try:
-    from .dat_parser import DatGrid, dat_to_csv_bytes, load_dat_from_path, load_dat_from_upload
+    from .dat_parser import DatGrid, dat_to_csv_bytes
     from .processing import (
-        PeakResult,
         compute_quality_report,
         crop_roi_2d,
-        detect_peaks_with_fwhm,
         extract_profile,
-        fit_gaussian,
-        fit_multi_gaussian,
         fft2d_filter,
         fft_analysis_1d,
-        integrate_range,
-        normalize_minmax,
+        fit_gaussian,
+        fit_multi_gaussian,
         radial_bin_stats,
         repair_outlier_point,
-        smooth_signal,
+    )
+    from .plots import apply_visual_transform, export_plot_png, plot_contour_overlay, plot_heatmap, plot_surface
+    from .ui import (
+        align_curve_by_peak,
+        choose_input_files,
+        compare_profiles,
+        multi_roi_stats,
+        remap_grid_to_angle,
+        show_editable_table,
+        show_profile_analysis,
+        to_angle_axis,
+    )
+    from .llm import call_siliconflow_llm
+    from .reports import (
+        batch_process,
+        generate_html_report,
+        generate_markdown_report,
+        get_workflow_names,
+        load_workflow,
+        save_workflow,
     )
 except ImportError:
-    from dat_parser import DatGrid, dat_to_csv_bytes, load_dat_from_path, load_dat_from_upload
+    from dat_parser import DatGrid, dat_to_csv_bytes
     from processing import (
-        PeakResult,
         compute_quality_report,
         crop_roi_2d,
-        detect_peaks_with_fwhm,
         extract_profile,
-        fit_gaussian,
-        fit_multi_gaussian,
         fft2d_filter,
         fft_analysis_1d,
-        integrate_range,
-        normalize_minmax,
+        fit_gaussian,
+        fit_multi_gaussian,
         radial_bin_stats,
         repair_outlier_point,
-        smooth_signal,
+    )
+    from plots import apply_visual_transform, export_plot_png, plot_contour_overlay, plot_heatmap, plot_surface
+    from ui import (
+        align_curve_by_peak,
+        choose_input_files,
+        compare_profiles,
+        multi_roi_stats,
+        remap_grid_to_angle,
+        show_editable_table,
+        show_profile_analysis,
+        to_angle_axis,
+    )
+    from llm import call_siliconflow_llm
+    from reports import (
+        batch_process,
+        generate_html_report,
+        generate_markdown_report,
+        get_workflow_names,
+        load_workflow,
+        save_workflow,
     )
 
 st.set_page_config(page_title="Optical DAT Viewer", layout="wide")
 st.title("光学 .dat 可视化与分析工具")
 st.caption("作者：胡一凡 | 邮箱：h1317483655@gmail.com | 有问题请通过邮箱反馈。")
-WORKFLOW_DIR = Path("optics_dat_viewer/workflows")
-WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def plot_heatmap(grid: DatGrid, title: str) -> go.Figure:
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=grid.data,
-            x=grid.x_coords,
-            y=grid.y_coords,
-            colorscale="Viridis",
-            colorbar={"title": "Intensity"},
-        )
+# ══════════════════════════════════════════════
+# 综合分析：各可视化模式
+# ══════════════════════════════════════════════
+
+def _render_heatmap_mode(cropped_grid: DatGrid) -> go.Figure:
+    c1, c2 = st.columns(2)
+    with c1:
+        log_scale = st.checkbox("对数色阶(log1p)", value=False)
+    with c2:
+        show_contour = st.checkbox("叠加等高线", value=False)
+
+    st.markdown("**标注工具**")
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        ann_x = st.number_input("标注X", value=float(cropped_grid.x_coords[0]))
+    with a2:
+        ann_y = st.number_input("标注Y", value=float(cropped_grid.y_coords[0]))
+    with a3:
+        ann_text = st.text_input("标注文本", value="")
+    with a4:
+        if st.button("添加标注"):
+            st.session_state.setdefault("annotations", [])
+            st.session_state["annotations"].append({"x": ann_x, "y": ann_y, "text": ann_text})
+
+    vis_grid = DatGrid(
+        rows=cropped_grid.rows,
+        cols=cropped_grid.cols,
+        hole_value=cropped_grid.hole_value,
+        row_delta=cropped_grid.row_delta,
+        col_delta=cropped_grid.col_delta,
+        row_origin=cropped_grid.row_origin,
+        col_origin=cropped_grid.col_origin,
+        data=apply_visual_transform(cropped_grid.data, log_scale),
     )
-    fig.update_layout(
-        title=title,
-        xaxis_title="X",
-        yaxis_title="Y",
-        yaxis={"scaleanchor": "x", "scaleratio": 1},
-    )
-    return fig
-
-
-def plot_surface(grid: DatGrid, title: str) -> go.Figure:
-    fig = go.Figure(
-        data=go.Surface(z=grid.data, x=grid.x_coords, y=grid.y_coords, colorscale="Viridis")
-    )
-    fig.update_layout(title=title, scene={"xaxis_title": "X", "yaxis_title": "Y", "zaxis_title": "I"})
-    return fig
-
-
-def export_plot_png(fig: go.Figure) -> bytes:
-    buffer = BytesIO()
-    fig.write_image(buffer, format="png")
-    return buffer.getvalue()
-
-
-def preprocess_profile(y: np.ndarray, do_smooth: bool, do_norm: bool, window: int) -> np.ndarray:
-    processed = y.copy()
-    if do_smooth:
-        processed = smooth_signal(processed, window_length=window)
-    if do_norm:
-        processed = normalize_minmax(processed)
-    return processed
-
-
-def to_angle_axis(length: int, start_deg: float = 0.0, end_deg: float = 4.0) -> np.ndarray:
-    if length <= 1:
-        return np.array([start_deg], dtype=float)
-    return np.linspace(start_deg, end_deg, length)
-
-
-def remap_grid_to_angle(grid: DatGrid) -> DatGrid:
-    col_delta = 4.0 / max(1, grid.cols - 1)
-    row_delta = 4.0 / max(1, grid.rows - 1)
-    return DatGrid(
-        rows=grid.rows,
-        cols=grid.cols,
-        hole_value=grid.hole_value,
-        row_delta=row_delta,
-        col_delta=col_delta,
-        row_origin=0.0,
-        col_origin=0.0,
-        data=grid.data,
-    )
-
-
-def align_curve_by_peak(x: np.ndarray, y: np.ndarray, target_peak_deg: float = 2.0) -> np.ndarray:
-    if len(x) == 0:
-        return x
-    signal = np.where(np.isfinite(y), y, np.nanmedian(y))
-    peak_idx = int(np.nanargmax(signal))
-    peak_x = float(x[peak_idx])
-    return x - peak_x + target_peak_deg
-
-
-def show_profile_analysis(x: np.ndarray, y: np.ndarray, axis_label: str) -> tuple[go.Figure, PeakResult, float]:
-    st.subheader(f"{axis_label} 剖面分析")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        do_smooth = st.checkbox("平滑", value=True, key=f"smooth_{axis_label}")
-    with col2:
-        do_norm = st.checkbox("归一化", value=False, key=f"norm_{axis_label}")
-    with col3:
-        window = st.slider("平滑窗口(奇数)", 3, 41, 9, 2, key=f"window_{axis_label}")
-
-    processed = preprocess_profile(y, do_smooth, do_norm, window)
-    prom = st.slider("峰值显著性", 0.0, float(np.nanmax(processed) if np.nanmax(processed) > 0 else 1.0), 0.05, key=f"prom_{axis_label}")
-    dist = st.slider("峰间最小间距", 1, max(2, len(processed) // 5), 5, key=f"dist_{axis_label}")
-    peak_res = detect_peaks_with_fwhm(x, processed, prominence=prom, distance=dist)
-
-    integral_min, integral_max = st.select_slider(
-        "积分区间",
-        options=list(x),
-        value=(float(x[0]), float(x[-1])),
-        key=f"int_{axis_label}",
-    )
-    area = integrate_range(x, processed, integral_min, integral_max)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=processed, mode="lines", name=f"{axis_label} profile"))
-    if len(peak_res.peak_x) > 0:
+    fig = plot_heatmap(vis_grid, "ROI 热力图")
+    anns = st.session_state.get("annotations", [])
+    if anns:
         fig.add_trace(
             go.Scatter(
-                x=peak_res.peak_x,
-                y=peak_res.peak_y,
-                mode="markers",
-                marker={"size": 9, "color": "red"},
-                name="Peaks",
+                x=[a["x"] for a in anns],
+                y=[a["y"] for a in anns],
+                mode="markers+text",
+                text=[a["text"] for a in anns],
+                textposition="top center",
+                marker={"size": 8, "color": "white"},
+                name="Annotations",
             )
         )
-    fig.update_layout(xaxis_title=axis_label, yaxis_title="Intensity", height=420)
-    return fig, peak_res, area
-
-
-def choose_input_files() -> list[DatGrid]:
-    st.sidebar.header("文件输入")
-    uploaded = st.sidebar.file_uploader("上传 .dat 文件（可多选）", type=["dat"], accept_multiple_files=True)
-    default_path = "/Users/fan/Downloads/guangyuan1000wan.dat"
-    local_path = st.sidebar.text_input("或输入本地文件路径", value=default_path)
-
-    grids: list[DatGrid] = []
-    for uf in uploaded or []:
-        grids.append(load_dat_from_upload(uf))
-
-    if local_path.strip():
-        path = Path(local_path.strip())
-        if path.exists():
-            grids.append(load_dat_from_path(path))
-        else:
-            st.sidebar.warning("本地路径不存在，将仅使用上传文件。")
-
-    return grids
-
-
-def compare_profiles(
-    grids: list[DatGrid],
-    axis: str,
-    index: int,
-    use_angle_axis: bool = True,
-    do_align: bool = False,
-    target_peak_deg: float = 2.0,
-) -> go.Figure:
-    fig = go.Figure()
-    for idx, grid in enumerate(grids):
-        if axis == "x":
-            x = grid.x_coords
-            y = extract_profile(grid.data, "x", min(index, grid.rows - 1))
-            label = f"File {idx + 1} - row {min(index, grid.rows - 1)}"
-        else:
-            x = grid.y_coords
-            y = extract_profile(grid.data, "y", min(index, grid.cols - 1))
-            label = f"File {idx + 1} - col {min(index, grid.cols - 1)}"
-        y = normalize_minmax(np.where(np.isfinite(y), y, 0.0))
-        if use_angle_axis:
-            x = to_angle_axis(len(y), 0.0, 4.0)
-        if do_align:
-            x = align_curve_by_peak(x, y, target_peak_deg=target_peak_deg)
-        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=label))
-    x_label = "Angle (deg)" if use_angle_axis else ("X" if axis == "x" else "Y")
-    fig.update_layout(height=420, title="多文件剖面对比（归一化）", xaxis_title=x_label, yaxis_title="Intensity")
+    st.plotly_chart(fig, use_container_width=True)
+    if show_contour:
+        contour_levels = st.slider("等高线层数", 5, 50, 20)
+        st.plotly_chart(plot_contour_overlay(vis_grid, contour_levels), use_container_width=True)
     return fig
 
 
-def show_editable_table(grid: DatGrid) -> np.ndarray:
-    st.subheader("表格信息与数据编辑")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("行数", f"{grid.rows}")
-    c2.metric("列数", f"{grid.cols}")
-    c3.metric("最小值", f"{np.nanmin(grid.data):.6g}" if np.isfinite(np.nanmin(grid.data)) else "NaN")
-    c4.metric("最大值", f"{np.nanmax(grid.data):.6g}" if np.isfinite(np.nanmax(grid.data)) else "NaN")
-
-    table_df = pd.DataFrame(grid.data)
-    table_df.index = np.arange(grid.rows)
-    table_df.columns = np.arange(grid.cols)
-    table_df.index.name = "row_index"
-
-    st.caption(
-        "表格显示行号/列号索引，可直接修改单元格；修改会立即用于后续可视化、分析和导出。"
-    )
-    edited_df = st.data_editor(
-        table_df,
-        use_container_width=True,
-        num_rows="fixed",
-        key="roi_data_editor",
-    )
-    return edited_df.to_numpy(dtype=float)
-
-
-def apply_visual_transform(data: np.ndarray, log_scale: bool) -> np.ndarray:
-    transformed = data.copy()
-    if log_scale:
-        transformed = np.log1p(np.clip(transformed, a_min=0, a_max=None))
-    return transformed
-
-
-def plot_contour_overlay(grid: DatGrid, levels: int) -> go.Figure:
-    fig = go.Figure(
-        data=go.Contour(
-            z=grid.data,
-            x=grid.x_coords,
-            y=grid.y_coords,
-            ncontours=levels,
-            colorscale="Viridis",
-        )
-    )
-    fig.update_layout(title="等高线图", xaxis_title="X", yaxis_title="Y", height=500)
+def _render_surface_mode(cropped_grid: DatGrid) -> go.Figure:
+    fig = plot_surface(cropped_grid, "ROI 3D 表面")
+    st.plotly_chart(fig, use_container_width=True)
     return fig
 
 
-def save_workflow(workflow_name: str, payload: dict) -> None:
-    path = WORKFLOW_DIR / f"{workflow_name}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def _render_profile_mode(cropped_grid: DatGrid) -> tuple[go.Figure, pd.DataFrame]:
+    axis = st.selectbox("剖面方向", ["x", "y"])
+    do_align = st.checkbox("按峰位对齐", value=False)
+    target_peak_deg = st.slider("对齐目标角度(°)", 0.0, 4.0, 2.0, 0.05) if do_align else 2.0
+    if axis == "x":
+        row_idx = st.slider("选择行索引", 0, max(0, cropped_grid.rows - 1), min(10, max(0, cropped_grid.rows - 1)))
+        x = cropped_grid.x_coords
+        y = extract_profile(cropped_grid.data, axis="x", index=row_idx)
+    else:
+        col_idx = st.slider("选择列索引", 0, max(0, cropped_grid.cols - 1), min(10, max(0, cropped_grid.cols - 1)))
+        x = cropped_grid.y_coords
+        y = extract_profile(cropped_grid.data, axis="y", index=col_idx)
+    x = to_angle_axis(len(y), 0.0, 4.0)
+    if do_align:
+        x = align_curve_by_peak(x, y, target_peak_deg=target_peak_deg)
 
+    fig, peaks, area = show_profile_analysis(x, y, axis_label=axis.upper())
 
-def load_workflow(workflow_name: str) -> dict:
-    path = WORKFLOW_DIR / f"{workflow_name}.json"
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def get_workflow_names() -> list[str]:
-    return sorted([p.stem for p in WORKFLOW_DIR.glob("*.json")])
-
-
-def multi_roi_stats(grid: DatGrid) -> pd.DataFrame:
-    st.subheader("多 ROI 区域统计")
-    roi_count = st.number_input("ROI 数量", min_value=1, max_value=6, value=2, step=1)
-    records: list[dict] = []
-    for i in range(int(roi_count)):
-        st.markdown(f"**ROI {i + 1}**")
-        c1, c2 = st.columns(2)
-        with c1:
-            x_range = st.slider(
-                f"ROI{i+1} X范围",
-                float(grid.x_coords[0]),
-                float(grid.x_coords[-1]),
-                (float(grid.x_coords[0]), float(grid.x_coords[-1])),
-                key=f"roi_x_{i}",
-            )
-        with c2:
-            y_range = st.slider(
-                f"ROI{i+1} Y范围",
-                float(grid.y_coords[0]),
-                float(grid.y_coords[-1]),
-                (float(grid.y_coords[0]), float(grid.y_coords[-1])),
-                key=f"roi_y_{i}",
-            )
-        sub, _, _ = crop_roi_2d(
-            grid.data, grid.x_coords, grid.y_coords, x_range[0], x_range[1], y_range[0], y_range[1]
+    do_fit = st.checkbox("执行高斯拟合", value=True)
+    if do_fit:
+        fit_res = fit_gaussian(x, np.where(np.isfinite(y), y, np.nanmedian(y)))
+        fig.add_trace(go.Scatter(x=x, y=fit_res.fitted_y, mode="lines", name="Gaussian Fit"))
+        st.write(
+            {
+                "fit_success": fit_res.success,
+                "amplitude": fit_res.amplitude,
+                "center": fit_res.center,
+                "sigma": fit_res.sigma,
+                "offset": fit_res.offset,
+            }
         )
-        vals = sub[np.isfinite(sub)]
-        if vals.size == 0:
-            records.append({"roi": i + 1, "mean": np.nan, "std": np.nan, "sum": np.nan, "max": np.nan})
+        multi_fit = st.checkbox("多峰拟合增强")
+        if multi_fit:
+            n_peaks = st.slider("多峰数量", 2, 4, 2)
+            params, fitted_multi, ok = fit_multi_gaussian(x, y, n_peaks=n_peaks)
+            fig.add_trace(go.Scatter(x=x, y=fitted_multi, mode="lines", name="Multi-Gaussian"))
+            st.write({"multi_fit_success": ok, "params": params.tolist() if len(params) else []})
+    st.plotly_chart(fig, use_container_width=True)
+    st.metric("积分面积", f"{area:.6g}" if np.isfinite(area) else "NaN")
+    peak_export = pd.DataFrame({"peak_x": peaks.peak_x, "peak_y": peaks.peak_y, "fwhm": peaks.fwhm})
+    st.dataframe(peak_export, use_container_width=True)
+
+    # 傅立叶变换（FFT）分析
+    st.subheader("傅立叶变换（FFT）分析")
+    fft_enable = st.checkbox("启用 FFT 分析", value=True)
+    if fft_enable:
+        cutoff_ratio = st.slider("低通保留比例", 0.01, 1.0, 0.2, 0.01)
+        fft_res = fft_analysis_1d(x, np.where(np.isfinite(y), y, np.nanmedian(y)), cutoff_ratio=cutoff_ratio)
+
+        fft_fig = go.Figure()
+        fft_fig.add_trace(
+            go.Scatter(x=fft_res.frequencies, y=fft_res.magnitude, mode="lines", name="FFT Magnitude")
+        )
+        fft_fig.update_layout(title="频谱幅度图", xaxis_title="Frequency", yaxis_title="Magnitude", height=360)
+        st.plotly_chart(fft_fig, use_container_width=True)
+
+        recon_fig = go.Figure()
+        recon_fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="Original"))
+        recon_fig.add_trace(
+            go.Scatter(x=x, y=fft_res.reconstructed, mode="lines", name="Low-pass Reconstructed")
+        )
+        recon_fig.update_layout(title="原始信号 vs 低通重建", xaxis_title=axis.upper(), yaxis_title="Intensity", height=360)
+        st.plotly_chart(recon_fig, use_container_width=True)
+
+    return fig, peak_export
+
+
+def _render_compare_mode(grids: list[DatGrid]) -> go.Figure:
+    axis = st.selectbox("对比方向", ["x", "y"])
+    align_cmp = st.checkbox("对比曲线按峰位对齐", value=True)
+    align_target_cmp = st.slider("对比对齐目标角度(°)", 0.0, 4.0, 2.0, 0.05) if align_cmp else 2.0
+    max_idx = min(g.rows if axis == "x" else g.cols for g in grids) - 1
+    idx = st.slider("剖面索引", 0, max(0, max_idx), min(10, max(0, max_idx)))
+    fig = compare_profiles(grids, axis=axis, index=idx, use_angle_axis=True, do_align=align_cmp, target_peak_deg=align_target_cmp)
+    st.plotly_chart(fig, use_container_width=True)
+    return fig
+
+
+def _render_timeseries_mode(grids: list[DatGrid]) -> go.Figure | None:
+    if len(grids) < 2:
+        st.info("时序对比至少需要两个文件（上传多文件即可）。")
+        return None
+    frame = st.slider("帧序号", 0, len(grids) - 1, 0)
+    frame_grid = grids[frame]
+    fig = plot_heatmap(frame_grid, f"Frame {frame + 1}")
+    st.plotly_chart(fig, use_container_width=True)
+    if frame > 0:
+        prev = grids[frame - 1]
+        diff = frame_grid.data - prev.data
+        diff_grid = DatGrid(
+            rows=frame_grid.rows, cols=frame_grid.cols, hole_value=frame_grid.hole_value,
+            row_delta=frame_grid.row_delta, col_delta=frame_grid.col_delta,
+            row_origin=frame_grid.row_origin, col_origin=frame_grid.col_origin, data=diff,
+        )
+        st.plotly_chart(plot_heatmap(diff_grid, "与前一帧差分图"), use_container_width=True)
+    return fig
+
+
+def _render_overview_page(cropped_grid: DatGrid, grids: list[DatGrid]) -> tuple[go.Figure | None, pd.DataFrame]:
+    """综合分析：选择可视化模式并渲染"""
+    mode = st.radio(
+        "选择可视化模式",
+        ["2D 热力图", "3D 表面图", "剖面图分析", "多文件对比", "时序对比"],
+        horizontal=True,
+    )
+    if mode == "2D 热力图":
+        return _render_heatmap_mode(cropped_grid), pd.DataFrame()
+    elif mode == "3D 表面图":
+        return _render_surface_mode(cropped_grid), pd.DataFrame()
+    elif mode == "剖面图分析":
+        return _render_profile_mode(cropped_grid)
+    elif mode == "多文件对比":
+        return _render_compare_mode(grids), pd.DataFrame()
+    else:
+        return _render_timeseries_mode(grids), pd.DataFrame()
+
+
+# ══════════════════════════════════════════════
+# 频域分析
+# ══════════════════════════════════════════════
+
+def _render_fft_page(cropped_grid: DatGrid) -> None:
+    st.subheader("2D FFT 频域分析")
+    fm = st.selectbox("滤波类型", ["lowpass", "highpass", "bandpass"])
+    c1, c2 = st.columns(2)
+    with c1:
+        low_ratio = st.slider("低频阈值比例", 0.01, 1.0, 0.1, 0.01)
+    with c2:
+        high_ratio = st.slider("高频阈值比例", 0.01, 1.0, 0.4, 0.01)
+    fft2 = fft2d_filter(cropped_grid.data, filter_mode=fm, low_ratio=low_ratio, high_ratio=high_ratio)
+
+    mag_grid = DatGrid(
+        rows=cropped_grid.rows, cols=cropped_grid.cols, hole_value=cropped_grid.hole_value,
+        row_delta=cropped_grid.row_delta, col_delta=cropped_grid.col_delta,
+        row_origin=cropped_grid.row_origin, col_origin=cropped_grid.col_origin,
+        data=fft2.magnitude,
+    )
+    recon_grid = DatGrid(
+        rows=cropped_grid.rows, cols=cropped_grid.cols, hole_value=cropped_grid.hole_value,
+        row_delta=cropped_grid.row_delta, col_delta=cropped_grid.col_delta,
+        row_origin=cropped_grid.row_origin, col_origin=cropped_grid.col_origin,
+        data=fft2.filtered_reconstructed,
+    )
+    st.plotly_chart(plot_heatmap(mag_grid, "2D FFT 频谱幅度"), use_container_width=True)
+    st.plotly_chart(plot_heatmap(recon_grid, "滤波后重建图"), use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+# AI 大模型分析
+# ══════════════════════════════════════════════
+
+def _render_ai_page(quality_df, roi_df, radial_df, cropped_grid, peak_export, batch_df):
+    st.subheader("SiliconFlow 大模型分析")
+    st.caption("填写你自己的 SiliconFlow API Key 后可调用模型分析。")
+    st.markdown("注册链接：[SiliconFlow 注册与API创建](https://cloud.siliconflow.cn/i/tOIjnzot)")
+    api_key = st.text_input("SiliconFlow API Key", type="password", value=st.session_state.get("sf_api_key", ""))
+    if api_key:
+        st.session_state["sf_api_key"] = api_key
+    model = st.selectbox(
+        "选择模型",
+        [
+            "Pro/MiniMaxAI/MiniMax-M2.5",
+            "Pro/moonshotai/Kimi-K2.6",
+            "Pro/zai-org/GLM-5.1",
+            "Pro/deepseek-ai/DeepSeek-V3.2",
+        ],
+    )
+    system_prompt = st.text_area(
+        "System Prompt",
+        value=(
+            "你是光学数据分析助手。请基于用户提供的统计指标，输出：1)关键现象，"
+            "2)可能原因，3)下一步实验建议，4)参数调优建议。输出结构化中文。"
+        ),
+    )
+    auto_context = {
+        "quality": quality_df.to_dict(orient="records"),
+        "roi": roi_df.to_dict(orient="records"),
+        "radial": radial_df.head(20).to_dict(orient="records"),
+    }
+    llm_upload = st.file_uploader("上传补充分析文件（txt/csv/json）", type=["txt", "csv", "json"])
+    uploaded_text = ""
+    if llm_upload is not None:
+        uploaded_text = llm_upload.getvalue().decode("utf-8", errors="ignore")[:5000]
+    user_prompt = st.text_area(
+        "User Prompt",
+        value=(
+            "请分析这组光学数据并给出建议："
+            f"{json.dumps(auto_context, ensure_ascii=False)}\n"
+            f"补充文件内容：{uploaded_text}"
+        ),
+        height=180,
+    )
+    if st.button("上传并进行大模型分析"):
+        if not api_key.strip():
+            st.error("请先输入 API Key")
         else:
-            records.append(
-                {
-                    "roi": i + 1,
-                    "mean": float(np.mean(vals)),
-                    "std": float(np.std(vals)),
-                    "sum": float(np.sum(vals)),
-                    "max": float(np.max(vals)),
-                }
-            )
-    return pd.DataFrame(records)
+            with st.spinner("模型分析中..."):
+                parts = []
+                parts.append("=== 质量诊断 ===")
+                parts.append(quality_df.to_csv(index=False))
+                parts.append("\n=== ROI 统计 ===")
+                parts.append(roi_df.to_csv(index=False))
+                parts.append("\n=== 径向统计（前20行） ===")
+                parts.append(radial_df.head(20).to_csv(index=False))
+                parts.append("\n=== ROI 数据矩阵 ===")
+                parts.append(pd.DataFrame(cropped_grid.data).to_csv(index=False))
+                if not peak_export.empty:
+                    parts.append("\n=== 峰值分析 ===")
+                    parts.append(peak_export.to_csv(index=False))
+                if not batch_df.empty:
+                    parts.append("\n=== 批处理汇总 ===")
+                    parts.append(batch_df.head(20).to_csv(index=False))
+                data_text = "\n".join(parts)
+                result = call_siliconflow_llm(api_key.strip(), model, system_prompt, user_prompt, data_text=data_text)
+            st.markdown("#### 模型分析结果")
+            st.markdown(result)
 
 
-def batch_process(folder_path: str) -> pd.DataFrame:
-    folder = Path(folder_path)
-    rows = []
-    if not folder.exists():
-        return pd.DataFrame()
-    for file in sorted(folder.glob("*.dat")):
-        try:
-            g = load_dat_from_path(file)
-            vals = g.data[np.isfinite(g.data)]
-            rows.append(
-                {
-                    "file": file.name,
-                    "rows": g.rows,
-                    "cols": g.cols,
-                    "mean": float(np.mean(vals)) if vals.size else np.nan,
-                    "max": float(np.max(vals)) if vals.size else np.nan,
-                    "sum": float(np.sum(vals)) if vals.size else np.nan,
-                }
-            )
-        except Exception as exc:
-            rows.append({"file": file.name, "error": str(exc)})
-    return pd.DataFrame(rows)
-
-
-def generate_html_report(quality_df: pd.DataFrame, roi_df: pd.DataFrame, radial_df: pd.DataFrame) -> str:
-    return f"""
-<html><head><meta charset='utf-8'><title>Optics Report</title></head><body>
-<h1>光学数据分析报告</h1>
-<h2>质量诊断</h2>{quality_df.to_html(index=False)}
-<h2>多ROI统计</h2>{roi_df.to_html(index=False)}
-<h2>径向分箱统计</h2>{radial_df.to_html(index=False)}
-</body></html>
-"""
-
-
-def generate_markdown_report(
-    quality_df: pd.DataFrame,
-    roi_df: pd.DataFrame,
-    radial_df: pd.DataFrame,
-    batch_df: pd.DataFrame,
-) -> str:
-    q = quality_df.iloc[0].to_dict() if not quality_df.empty else {}
-    roi_line = (
-        f"```csv\n{roi_df.to_csv(index=False)}\n```"
-        if not roi_df.empty
-        else "无 ROI 数据"
-    )
-    radial_line = (
-        f"```csv\n{radial_df.head(10).to_csv(index=False)}\n```"
-        if not radial_df.empty
-        else "无径向数据"
-    )
-    batch_line = (
-        f"```csv\n{batch_df.head(20).to_csv(index=False)}\n```"
-        if not batch_df.empty
-        else "未执行批处理"
-    )
-    return f"""# 光学数据自动分析报告
-
-## 1. 质量诊断摘要
-- nan_ratio: {q.get('nan_ratio', 'N/A')}
-- zero_ratio: {q.get('zero_ratio', 'N/A')}
-- saturated_ratio: {q.get('saturated_ratio', 'N/A')}
-- outlier_ratio: {q.get('outlier_ratio', 'N/A')}
-- mean: {q.get('mean', 'N/A')}
-- std_dev: {q.get('std_dev', 'N/A')}
-
-## 2. ROI 统计
-{roi_line}
-
-## 3. 径向分箱统计（前10条）
-{radial_line}
-
-## 4. 批次看板（前20条）
-{batch_line}
-
-## 5. 自动结论
-- 若 outlier_ratio > 0.01，建议执行异常点修复与频域滤波。
-- 若 saturated_ratio 偏高，建议检查曝光或增益设置。
-- 若批次中 mean/max 波动较大，建议做时序稳定性评估与设备校准。
-"""
-
-
-def call_siliconflow_llm(
-    api_key: str,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    excel_text: str | None = None,
-) -> str:
-    if OpenAI is None:
-        return "当前环境未安装 openai 依赖，请先安装 requirements。"
-    try:
-        client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
-        full_prompt = user_prompt
-        if excel_text:
-            full_prompt += f"\n\n--- 数据附件（CSV 格式） ---\n{excel_text}"
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": full_prompt},
-            ],
-            temperature=0.3,
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as exc:
-        return f"调用失败: {exc}"
-
+# ══════════════════════════════════════════════
+# 主流程
+# ══════════════════════════════════════════════
 
 def main() -> None:
+    # ── 1. 数据加载 ──
     try:
         grids = choose_input_files()
     except Exception as exc:
@@ -442,8 +374,9 @@ def main() -> None:
         st.info("请上传或指定至少一个 .dat 文件。")
         return
     grids = [remap_grid_to_angle(g) for g in grids]
-
     grid = grids[0]
+
+    # ── 2. 侧边栏：导航 + ROI ──
     st.sidebar.header("导航目录")
     nav = st.sidebar.radio(
         "跳转到功能区",
@@ -451,244 +384,45 @@ def main() -> None:
         index=0,
     )
     st.sidebar.header("ROI 选择")
-    x_min, x_max = st.sidebar.slider("X 范围", float(grid.x_coords[0]), float(grid.x_coords[-1]), (float(grid.x_coords[0]), float(grid.x_coords[-1])))
-    y_min, y_max = st.sidebar.slider("Y 范围", float(grid.y_coords[0]), float(grid.y_coords[-1]), (float(grid.y_coords[0]), float(grid.y_coords[-1])))
-
+    x_min, x_max = st.sidebar.slider(
+        "X 范围", float(grid.x_coords[0]), float(grid.x_coords[-1]),
+        (float(grid.x_coords[0]), float(grid.x_coords[-1])),
+    )
+    y_min, y_max = st.sidebar.slider(
+        "Y 范围", float(grid.y_coords[0]), float(grid.y_coords[-1]),
+        (float(grid.y_coords[0]), float(grid.y_coords[-1])),
+    )
     cropped_data, cropped_x, cropped_y = crop_roi_2d(
         grid.data, grid.x_coords, grid.y_coords, x_min, x_max, y_min, y_max
     )
     cropped_grid = DatGrid(
-        rows=len(cropped_y),
-        cols=len(cropped_x),
+        rows=len(cropped_y), cols=len(cropped_x),
         hole_value=grid.hole_value,
-        row_delta=grid.row_delta,
-        col_delta=grid.col_delta,
+        row_delta=grid.row_delta, col_delta=grid.col_delta,
         row_origin=float(cropped_y[0]) if len(cropped_y) else grid.row_origin,
         col_origin=float(cropped_x[0]) if len(cropped_x) else grid.col_origin,
         data=cropped_data,
     )
+
+    # ── 3. 表格编辑 ──
     edited_data = show_editable_table(cropped_grid)
     cropped_grid = DatGrid(
-        rows=cropped_grid.rows,
-        cols=cropped_grid.cols,
+        rows=cropped_grid.rows, cols=cropped_grid.cols,
         hole_value=cropped_grid.hole_value,
-        row_delta=cropped_grid.row_delta,
-        col_delta=cropped_grid.col_delta,
-        row_origin=cropped_grid.row_origin,
-        col_origin=cropped_grid.col_origin,
+        row_delta=cropped_grid.row_delta, col_delta=cropped_grid.col_delta,
+        row_origin=cropped_grid.row_origin, col_origin=cropped_grid.col_origin,
         data=edited_data,
     )
 
-    mode = st.radio(
-        "选择可视化模式",
-        ["2D 热力图", "3D 表面图", "剖面图分析", "多文件对比", "时序对比"],
-        horizontal=True,
-    )
+    # ── 4. 可视化（按导航分支） ──
     fig = None
     peak_export = pd.DataFrame()
-    batch_df = pd.DataFrame()
+    if nav == "综合分析":
+        fig, peak_export = _render_overview_page(cropped_grid, grids)
+    elif nav == "频域分析(2D FFT)":
+        _render_fft_page(cropped_grid)
 
-    if nav == "综合分析" and mode == "2D 热力图":
-        c1, c2 = st.columns(2)
-        with c1:
-            log_scale = st.checkbox("对数色阶(log1p)", value=False)
-        with c2:
-            show_contour = st.checkbox("叠加等高线", value=False)
-        st.markdown("**标注工具**")
-        a1, a2, a3, a4 = st.columns(4)
-        with a1:
-            ann_x = st.number_input("标注X", value=float(cropped_grid.x_coords[0]))
-        with a2:
-            ann_y = st.number_input("标注Y", value=float(cropped_grid.y_coords[0]))
-        with a3:
-            ann_text = st.text_input("标注文本", value="")
-        with a4:
-            if st.button("添加标注"):
-                st.session_state.setdefault("annotations", [])
-                st.session_state["annotations"].append({"x": ann_x, "y": ann_y, "text": ann_text})
-        vis_grid = DatGrid(
-            rows=cropped_grid.rows,
-            cols=cropped_grid.cols,
-            hole_value=cropped_grid.hole_value,
-            row_delta=cropped_grid.row_delta,
-            col_delta=cropped_grid.col_delta,
-            row_origin=cropped_grid.row_origin,
-            col_origin=cropped_grid.col_origin,
-            data=apply_visual_transform(cropped_grid.data, log_scale),
-        )
-        fig = plot_heatmap(vis_grid, "ROI 热力图")
-        anns = st.session_state.get("annotations", [])
-        if anns:
-            fig.add_trace(
-                go.Scatter(
-                    x=[a["x"] for a in anns],
-                    y=[a["y"] for a in anns],
-                    mode="markers+text",
-                    text=[a["text"] for a in anns],
-                    textposition="top center",
-                    marker={"size": 8, "color": "white"},
-                    name="Annotations",
-                )
-            )
-        st.plotly_chart(fig, use_container_width=True)
-        if show_contour:
-            contour_levels = st.slider("等高线层数", 5, 50, 20)
-            st.plotly_chart(plot_contour_overlay(vis_grid, contour_levels), use_container_width=True)
-    elif nav == "综合分析" and mode == "3D 表面图":
-        fig = plot_surface(cropped_grid, "ROI 3D 表面")
-        st.plotly_chart(fig, use_container_width=True)
-    elif nav == "综合分析" and mode == "剖面图分析":
-        axis = st.selectbox("剖面方向", ["x", "y"])
-        do_align = st.checkbox("按峰位对齐", value=False)
-        target_peak_deg = st.slider("对齐目标角度(°)", 0.0, 4.0, 2.0, 0.05) if do_align else 2.0
-        if axis == "x":
-            row_idx = st.slider("选择行索引", 0, max(0, cropped_grid.rows - 1), min(10, max(0, cropped_grid.rows - 1)))
-            x = cropped_grid.x_coords
-            y = extract_profile(cropped_grid.data, axis="x", index=row_idx)
-        else:
-            col_idx = st.slider("选择列索引", 0, max(0, cropped_grid.cols - 1), min(10, max(0, cropped_grid.cols - 1)))
-            x = cropped_grid.y_coords
-            y = extract_profile(cropped_grid.data, axis="y", index=col_idx)
-        x = to_angle_axis(len(y), 0.0, 4.0)
-        if do_align:
-            x = align_curve_by_peak(x, y, target_peak_deg=target_peak_deg)
-
-        fig, peaks, area = show_profile_analysis(x, y, axis_label=axis.upper())
-        do_fit = st.checkbox("执行高斯拟合", value=True)
-        if do_fit:
-            fit_res = fit_gaussian(x, np.where(np.isfinite(y), y, np.nanmedian(y)))
-            fig.add_trace(go.Scatter(x=x, y=fit_res.fitted_y, mode="lines", name="Gaussian Fit"))
-            st.write(
-                {
-                    "fit_success": fit_res.success,
-                    "amplitude": fit_res.amplitude,
-                    "center": fit_res.center,
-                    "sigma": fit_res.sigma,
-                    "offset": fit_res.offset,
-                }
-            )
-            multi_fit = st.checkbox("多峰拟合增强")
-            if multi_fit:
-                n_peaks = st.slider("多峰数量", 2, 4, 2)
-                params, fitted_multi, ok = fit_multi_gaussian(x, y, n_peaks=n_peaks)
-                fig.add_trace(go.Scatter(x=x, y=fitted_multi, mode="lines", name="Multi-Gaussian"))
-                st.write({"multi_fit_success": ok, "params": params.tolist() if len(params) else []})
-        st.plotly_chart(fig, use_container_width=True)
-        st.metric("积分面积", f"{area:.6g}" if np.isfinite(area) else "NaN")
-        peak_export = pd.DataFrame({"peak_x": peaks.peak_x, "peak_y": peaks.peak_y, "fwhm": peaks.fwhm})
-        st.dataframe(peak_export, use_container_width=True)
-
-        st.subheader("傅立叶变换（FFT）分析")
-        fft_enable = st.checkbox("启用 FFT 分析", value=True)
-        if fft_enable:
-            cutoff_ratio = st.slider("低通保留比例", 0.01, 1.0, 0.2, 0.01)
-            fft_res = fft_analysis_1d(x, np.where(np.isfinite(y), y, np.nanmedian(y)), cutoff_ratio=cutoff_ratio)
-
-            fft_fig = go.Figure()
-            fft_fig.add_trace(
-                go.Scatter(
-                    x=fft_res.frequencies,
-                    y=fft_res.magnitude,
-                    mode="lines",
-                    name="FFT Magnitude",
-                )
-            )
-            fft_fig.update_layout(
-                title="频谱幅度图",
-                xaxis_title="Frequency",
-                yaxis_title="Magnitude",
-                height=360,
-            )
-            st.plotly_chart(fft_fig, use_container_width=True)
-
-            recon_fig = go.Figure()
-            recon_fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="Original"))
-            recon_fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=fft_res.reconstructed,
-                    mode="lines",
-                    name="Low-pass Reconstructed",
-                )
-            )
-            recon_fig.update_layout(
-                title="原始信号 vs 低通重建",
-                xaxis_title=axis.upper(),
-                yaxis_title="Intensity",
-                height=360,
-            )
-            st.plotly_chart(recon_fig, use_container_width=True)
-    elif nav == "综合分析" and mode == "多文件对比":
-        axis = st.selectbox("对比方向", ["x", "y"])
-        align_cmp = st.checkbox("对比曲线按峰位对齐", value=True)
-        align_target_cmp = (
-            st.slider("对比对齐目标角度(°)", 0.0, 4.0, 2.0, 0.05) if align_cmp else 2.0
-        )
-        max_idx = min(g.rows if axis == "x" else g.cols for g in grids) - 1
-        idx = st.slider("剖面索引", 0, max(0, max_idx), min(10, max(0, max_idx)))
-        fig = compare_profiles(
-            grids,
-            axis=axis,
-            index=idx,
-            use_angle_axis=True,
-            do_align=align_cmp,
-            target_peak_deg=align_target_cmp,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    elif nav == "综合分析":
-        if len(grids) < 2:
-            st.info("时序对比至少需要两个文件（上传多文件即可）。")
-        else:
-            frame = st.slider("帧序号", 0, len(grids) - 1, 0)
-            frame_grid = grids[frame]
-            st.plotly_chart(plot_heatmap(frame_grid, f"Frame {frame + 1}"), use_container_width=True)
-            if frame > 0:
-                prev = grids[frame - 1]
-                diff = frame_grid.data - prev.data
-                diff_grid = DatGrid(
-                    rows=frame_grid.rows,
-                    cols=frame_grid.cols,
-                    hole_value=frame_grid.hole_value,
-                    row_delta=frame_grid.row_delta,
-                    col_delta=frame_grid.col_delta,
-                    row_origin=frame_grid.row_origin,
-                    col_origin=frame_grid.col_origin,
-                    data=diff,
-                )
-                st.plotly_chart(plot_heatmap(diff_grid, "与前一帧差分图"), use_container_width=True)
-
-    if nav == "频域分析(2D FFT)":
-        st.subheader("2D FFT 频域分析")
-        fm = st.selectbox("滤波类型", ["lowpass", "highpass", "bandpass"])
-        c1, c2 = st.columns(2)
-        with c1:
-            low_ratio = st.slider("低频阈值比例", 0.01, 1.0, 0.1, 0.01)
-        with c2:
-            high_ratio = st.slider("高频阈值比例", 0.01, 1.0, 0.4, 0.01)
-        fft2 = fft2d_filter(cropped_grid.data, filter_mode=fm, low_ratio=low_ratio, high_ratio=high_ratio)
-        mag_grid = DatGrid(
-            rows=cropped_grid.rows,
-            cols=cropped_grid.cols,
-            hole_value=cropped_grid.hole_value,
-            row_delta=cropped_grid.row_delta,
-            col_delta=cropped_grid.col_delta,
-            row_origin=cropped_grid.row_origin,
-            col_origin=cropped_grid.col_origin,
-            data=fft2.magnitude,
-        )
-        recon_grid = DatGrid(
-            rows=cropped_grid.rows,
-            cols=cropped_grid.cols,
-            hole_value=cropped_grid.hole_value,
-            row_delta=cropped_grid.row_delta,
-            col_delta=cropped_grid.col_delta,
-            row_origin=cropped_grid.row_origin,
-            col_origin=cropped_grid.col_origin,
-            data=fft2.filtered_reconstructed,
-        )
-        st.plotly_chart(plot_heatmap(mag_grid, "2D FFT 频谱幅度"), use_container_width=True)
-        st.plotly_chart(plot_heatmap(recon_grid, "滤波后重建图"), use_container_width=True)
-
+    # ── 5. 异常修复 ──
     st.subheader("异常点交互修复")
     r1, r2, r3 = st.columns(3)
     with r1:
@@ -699,30 +433,26 @@ def main() -> None:
         repair_method = st.selectbox("修复方式", ["median_3x3", "mean_3x3"])
     if st.button("执行异常点修复"):
         cropped_grid = DatGrid(
-            rows=cropped_grid.rows,
-            cols=cropped_grid.cols,
+            rows=cropped_grid.rows, cols=cropped_grid.cols,
             hole_value=cropped_grid.hole_value,
-            row_delta=cropped_grid.row_delta,
-            col_delta=cropped_grid.col_delta,
-            row_origin=cropped_grid.row_origin,
-            col_origin=cropped_grid.col_origin,
+            row_delta=cropped_grid.row_delta, col_delta=cropped_grid.col_delta,
+            row_origin=cropped_grid.row_origin, col_origin=cropped_grid.col_origin,
             data=repair_outlier_point(cropped_grid.data, int(bad_row), int(bad_col), repair_method),
         )
         st.success("已修复指定异常点（当前会话内生效）")
 
+    # ── 6. 数据质量与统计 ──
     st.subheader("数据质量诊断")
     qr = compute_quality_report(cropped_grid.data)
     quality_df = pd.DataFrame(
-        [
-            {
-                "nan_ratio": qr.nan_ratio,
-                "zero_ratio": qr.zero_ratio,
-                "saturated_ratio": qr.saturated_ratio,
-                "outlier_ratio": qr.outlier_ratio,
-                "std_dev": qr.std_dev,
-                "mean": qr.mean_val,
-            }
-        ]
+        [{
+            "nan_ratio": qr.nan_ratio,
+            "zero_ratio": qr.zero_ratio,
+            "saturated_ratio": qr.saturated_ratio,
+            "outlier_ratio": qr.outlier_ratio,
+            "std_dev": qr.std_dev,
+            "mean": qr.mean_val,
+        }]
     )
     st.dataframe(quality_df, use_container_width=True, hide_index=True)
 
@@ -749,27 +479,19 @@ def main() -> None:
         offset_col = 0.0
     radial_raw = radial_bin_stats(
         cropped_grid.data,
-        center_row=center_row,
-        center_col=center_col,
-        offset_row=offset_row,
-        offset_col=offset_col,
-        bins=bins,
+        center_row=center_row, center_col=center_col,
+        offset_row=offset_row, offset_col=offset_col, bins=bins,
     )
     radial_df = pd.DataFrame(radial_raw, columns=["r_min", "r_max", "mean", "sum", "count"])
     st.dataframe(radial_df, use_container_width=True, hide_index=True)
 
+    # ── 7. 流程模板 ──
     st.subheader("流程模板（参数保存/加载）")
     workflow_name = st.text_input("模板名", value="default_workflow")
     payload = {
-        "x_min": x_min,
-        "x_max": x_max,
-        "y_min": y_min,
-        "y_max": y_max,
-        "center_row": center_row,
-        "center_col": center_col,
-        "offset_row": offset_row,
-        "offset_col": offset_col,
-        "bins": bins,
+        "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+        "center_row": center_row, "center_col": center_col,
+        "offset_row": offset_row, "offset_col": offset_col, "bins": bins,
     }
     wf_col1, wf_col2 = st.columns(2)
     with wf_col1:
@@ -782,6 +504,7 @@ def main() -> None:
         if selected:
             st.json(load_workflow(selected))
 
+    # ── 8. 批量处理 ──
     st.subheader("批量处理")
     batch_path = st.text_input("批处理目录（扫描所有 .dat）", value="")
     batch_df = pd.DataFrame()
@@ -811,6 +534,7 @@ def main() -> None:
                     st.write("异常批次（|z|>2）")
                     st.dataframe(anomaly, use_container_width=True, hide_index=True)
 
+    # ── 9. 导出 ──
     st.subheader("导出")
     st.download_button(
         "导出当前 ROI 矩阵 CSV",
@@ -856,70 +580,9 @@ def main() -> None:
         mime="text/markdown",
     )
 
+    # ── 10. AI 大模型分析 ──
     if nav == "AI大模型分析":
-        st.subheader("SiliconFlow 大模型分析")
-        st.caption("填写你自己的 SiliconFlow API Key 后可调用模型分析。")
-        st.markdown("注册链接：[SiliconFlow 注册与API创建](https://cloud.siliconflow.cn/i/tOIjnzot)")
-        api_key = st.text_input("SiliconFlow API Key", type="password", value=st.session_state.get("sf_api_key", ""))
-        if api_key:
-            st.session_state["sf_api_key"] = api_key
-        model = st.selectbox(
-            "选择模型",
-            [
-                "Pro/MiniMaxAI/MiniMax-M2.5",
-                "Pro/moonshotai/Kimi-K2.6",
-                "Pro/zai-org/GLM-5.1",
-                "Pro/deepseek-ai/DeepSeek-V3.2",
-            ],
-        )
-        system_prompt = st.text_area(
-            "System Prompt",
-            value=(
-                "你是光学数据分析助手。请基于用户提供的统计指标，输出：1)关键现象，"
-                "2)可能原因，3)下一步实验建议，4)参数调优建议。输出结构化中文。"
-            ),
-        )
-        auto_context = {
-            "quality": quality_df.to_dict(orient="records"),
-            "roi": roi_df.to_dict(orient="records"),
-            "radial": radial_df.head(20).to_dict(orient="records"),
-        }
-        llm_upload = st.file_uploader("上传补充分析文件（txt/csv/json）", type=["txt", "csv", "json"])
-        uploaded_text = ""
-        if llm_upload is not None:
-            uploaded_text = llm_upload.getvalue().decode("utf-8", errors="ignore")[:5000]
-        user_prompt = st.text_area(
-            "User Prompt",
-            value=(
-                "请分析这组光学数据并给出建议："
-                f"{json.dumps(auto_context, ensure_ascii=False)}\n"
-                f"补充文件内容：{uploaded_text}"
-            ),
-            height=180,
-        )
-        if st.button("上传并进行大模型分析"):
-            if not api_key.strip():
-                st.error("请先输入 API Key")
-            else:
-                with st.spinner("模型分析中..."):
-                    parts = []
-                    parts.append("=== 质量诊断 ===")
-                    parts.append(quality_df.to_csv(index=False))
-                    parts.append("\n=== ROI 统计 ===")
-                    parts.append(roi_df.to_csv(index=False))
-                    parts.append("\n=== 径向统计（前20行） ===")
-                    parts.append(radial_df.head(20).to_csv(index=False))
-                    parts.append("\n=== ROI 数据矩阵 ===")
-                    parts.append(pd.DataFrame(cropped_grid.data).to_csv(index=False))
-                    if not peak_export.empty:
-                        parts.append("\n=== 峰值分析 ===")
-                        parts.append(peak_export.to_csv(index=False))
-                    if not batch_df.empty:
-                        parts.append("\n=== 批处理汇总 ===")
-                        parts.append(batch_df.head(20).to_csv(index=False))
-                    excel_text = "\n".join(parts)
-                    result = call_siliconflow_llm(api_key.strip(), model, system_prompt, user_prompt, excel_text=excel_text)
-                st.text_area("模型分析结果", value=result, height=300)
+        _render_ai_page(quality_df, roi_df, radial_df, cropped_grid, peak_export, batch_df)
 
 
 if __name__ == "__main__":
