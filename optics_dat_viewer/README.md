@@ -30,3 +30,9 @@ streamlit run optics_dat_viewer/app.py
 
 - 若导出 PNG 失败，请安装 `kaleido`。
 - 处理模块在缺失 `scipy` 时会自动使用基础算法兜底。
+
+## 作者与反馈
+
+- 作者：胡一凡
+- 邮箱：h1317483655@gmail.com
+- 有问题请通过邮箱反馈。

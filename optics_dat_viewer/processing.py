@@ -8,6 +8,10 @@ try:
     SCIPY_AVAILABLE = True
 except Exception:
     SCIPY_AVAILABLE = False
+try:
+    from scipy.optimize import curve_fit
+except Exception:
+    curve_fit = None
 
 
 @dataclass
@@ -16,6 +20,26 @@ class PeakResult:
     peak_x: np.ndarray
     peak_y: np.ndarray
     fwhm: np.ndarray
+
+
+@dataclass
+class GaussianFitResult:
+    amplitude: float
+    center: float
+    sigma: float
+    offset: float
+    fitted_y: np.ndarray
+    success: bool
+
+
+@dataclass
+class QualityReport:
+    nan_ratio: float
+    zero_ratio: float
+    saturated_ratio: float
+    outlier_ratio: float
+    std_dev: float
+    mean_val: float
 
 
 def smooth_signal(y: np.ndarray, window_length: int, polyorder: int = 2) -> np.ndarray:
@@ -130,3 +154,93 @@ def extract_profile(matrix: np.ndarray, axis: str, index: int) -> np.ndarray:
     if axis == "x":
         return matrix[index, :]
     return matrix[:, index]
+
+
+def gaussian_model(x: np.ndarray, amplitude: float, center: float, sigma: float, offset: float) -> np.ndarray:
+    sigma = max(abs(sigma), 1e-9)
+    return amplitude * np.exp(-0.5 * ((x - center) / sigma) ** 2) + offset
+
+
+def fit_gaussian(x: np.ndarray, y: np.ndarray) -> GaussianFitResult:
+    signal = np.where(np.isfinite(y), y, np.nanmedian(y))
+    if len(x) < 4:
+        return GaussianFitResult(0.0, float(x[0]) if len(x) else 0.0, 0.0, 0.0, signal, False)
+
+    amp0 = float(np.nanmax(signal) - np.nanmin(signal))
+    center0 = float(x[int(np.nanargmax(signal))])
+    sigma0 = float((x[-1] - x[0]) / 10.0 if x[-1] != x[0] else 1.0)
+    offset0 = float(np.nanmin(signal))
+
+    if curve_fit is None:
+        fitted = gaussian_model(x, amp0, center0, sigma0, offset0)
+        return GaussianFitResult(amp0, center0, sigma0, offset0, fitted, False)
+
+    try:
+        popt, _ = curve_fit(
+            gaussian_model,
+            x,
+            signal,
+            p0=[amp0, center0, sigma0, offset0],
+            maxfev=10000,
+        )
+        fitted = gaussian_model(x, *popt)
+        return GaussianFitResult(float(popt[0]), float(popt[1]), float(abs(popt[2])), float(popt[3]), fitted, True)
+    except Exception:
+        fitted = gaussian_model(x, amp0, center0, sigma0, offset0)
+        return GaussianFitResult(amp0, center0, sigma0, offset0, fitted, False)
+
+
+def compute_quality_report(matrix: np.ndarray, saturation_quantile: float = 0.999) -> QualityReport:
+    arr = matrix[np.isfinite(matrix)]
+    if arr.size == 0:
+        return QualityReport(1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    nan_ratio = 1.0 - (arr.size / matrix.size)
+    zero_ratio = float(np.mean(arr == 0))
+    sat_threshold = float(np.quantile(arr, saturation_quantile))
+    saturated_ratio = float(np.mean(arr >= sat_threshold))
+    mean_val = float(np.mean(arr))
+    std_dev = float(np.std(arr))
+    if std_dev == 0:
+        outlier_ratio = 0.0
+    else:
+        z = np.abs((arr - mean_val) / std_dev)
+        outlier_ratio = float(np.mean(z > 3))
+    return QualityReport(
+        nan_ratio=float(nan_ratio),
+        zero_ratio=zero_ratio,
+        saturated_ratio=saturated_ratio,
+        outlier_ratio=outlier_ratio,
+        std_dev=std_dev,
+        mean_val=mean_val,
+    )
+
+
+def radial_bin_stats(
+    matrix: np.ndarray,
+    center_row: float,
+    center_col: float,
+    offset_row: float = 0.0,
+    offset_col: float = 0.0,
+    bins: int = 10,
+) -> np.ndarray:
+    rows, cols = matrix.shape
+    rr, cc = np.indices((rows, cols))
+    rr = rr - offset_row
+    cc = cc - offset_col
+    radial = np.sqrt((rr - center_row) ** 2 + (cc - center_col) ** 2)
+    valid = np.isfinite(matrix)
+    r = radial[valid]
+    v = matrix[valid]
+    if r.size == 0:
+        return np.empty((0, 5))
+    edges = np.linspace(float(r.min()), float(r.max()), bins + 1)
+    out = []
+    for i in range(bins):
+        mask = (r >= edges[i]) & (r < edges[i + 1] if i < bins - 1 else r <= edges[i + 1])
+        if not np.any(mask):
+            out.append([edges[i], edges[i + 1], np.nan, np.nan, 0])
+            continue
+        vals = v[mask]
+        out.append([edges[i], edges[i + 1], float(np.mean(vals)), float(np.sum(vals)), int(vals.size)])
+    return np.array(out, dtype=float)

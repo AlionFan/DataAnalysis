@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,16 +12,22 @@ import streamlit as st
 from dat_parser import DatGrid, dat_to_csv_bytes, load_dat_from_path, load_dat_from_upload
 from processing import (
     PeakResult,
+    compute_quality_report,
     crop_roi_2d,
     detect_peaks_with_fwhm,
     extract_profile,
+    fit_gaussian,
     integrate_range,
     normalize_minmax,
+    radial_bin_stats,
     smooth_signal,
 )
 
 st.set_page_config(page_title="Optical DAT Viewer", layout="wide")
 st.title("光学 .dat 可视化与分析工具")
+st.caption("作者：胡一凡 | 邮箱：h1317483655@gmail.com | 有问题请通过邮箱反馈。")
+WORKFLOW_DIR = Path("optics_dat_viewer/workflows")
+WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def plot_heatmap(grid: DatGrid, title: str) -> go.Figure:
@@ -176,6 +183,120 @@ def show_editable_table(grid: DatGrid) -> np.ndarray:
     return edited_df.to_numpy(dtype=float)
 
 
+def apply_visual_transform(data: np.ndarray, log_scale: bool) -> np.ndarray:
+    transformed = data.copy()
+    if log_scale:
+        transformed = np.log1p(np.clip(transformed, a_min=0, a_max=None))
+    return transformed
+
+
+def plot_contour_overlay(grid: DatGrid, levels: int) -> go.Figure:
+    fig = go.Figure(
+        data=go.Contour(
+            z=grid.data,
+            x=grid.x_coords,
+            y=grid.y_coords,
+            ncontours=levels,
+            colorscale="Viridis",
+        )
+    )
+    fig.update_layout(title="等高线图", xaxis_title="X", yaxis_title="Y", height=500)
+    return fig
+
+
+def save_workflow(workflow_name: str, payload: dict) -> None:
+    path = WORKFLOW_DIR / f"{workflow_name}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_workflow(workflow_name: str) -> dict:
+    path = WORKFLOW_DIR / f"{workflow_name}.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def get_workflow_names() -> list[str]:
+    return sorted([p.stem for p in WORKFLOW_DIR.glob("*.json")])
+
+
+def multi_roi_stats(grid: DatGrid) -> pd.DataFrame:
+    st.subheader("多 ROI 区域统计")
+    roi_count = st.number_input("ROI 数量", min_value=1, max_value=6, value=2, step=1)
+    records: list[dict] = []
+    for i in range(int(roi_count)):
+        st.markdown(f"**ROI {i + 1}**")
+        c1, c2 = st.columns(2)
+        with c1:
+            x_range = st.slider(
+                f"ROI{i+1} X范围",
+                float(grid.x_coords[0]),
+                float(grid.x_coords[-1]),
+                (float(grid.x_coords[0]), float(grid.x_coords[-1])),
+                key=f"roi_x_{i}",
+            )
+        with c2:
+            y_range = st.slider(
+                f"ROI{i+1} Y范围",
+                float(grid.y_coords[0]),
+                float(grid.y_coords[-1]),
+                (float(grid.y_coords[0]), float(grid.y_coords[-1])),
+                key=f"roi_y_{i}",
+            )
+        sub, _, _ = crop_roi_2d(
+            grid.data, grid.x_coords, grid.y_coords, x_range[0], x_range[1], y_range[0], y_range[1]
+        )
+        vals = sub[np.isfinite(sub)]
+        if vals.size == 0:
+            records.append({"roi": i + 1, "mean": np.nan, "std": np.nan, "sum": np.nan, "max": np.nan})
+        else:
+            records.append(
+                {
+                    "roi": i + 1,
+                    "mean": float(np.mean(vals)),
+                    "std": float(np.std(vals)),
+                    "sum": float(np.sum(vals)),
+                    "max": float(np.max(vals)),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def batch_process(folder_path: str) -> pd.DataFrame:
+    folder = Path(folder_path)
+    rows = []
+    if not folder.exists():
+        return pd.DataFrame()
+    for file in sorted(folder.glob("*.dat")):
+        try:
+            g = load_dat_from_path(file)
+            vals = g.data[np.isfinite(g.data)]
+            rows.append(
+                {
+                    "file": file.name,
+                    "rows": g.rows,
+                    "cols": g.cols,
+                    "mean": float(np.mean(vals)) if vals.size else np.nan,
+                    "max": float(np.max(vals)) if vals.size else np.nan,
+                    "sum": float(np.sum(vals)) if vals.size else np.nan,
+                }
+            )
+        except Exception as exc:
+            rows.append({"file": file.name, "error": str(exc)})
+    return pd.DataFrame(rows)
+
+
+def generate_html_report(quality_df: pd.DataFrame, roi_df: pd.DataFrame, radial_df: pd.DataFrame) -> str:
+    return f"""
+<html><head><meta charset='utf-8'><title>Optics Report</title></head><body>
+<h1>光学数据分析报告</h1>
+<h2>质量诊断</h2>{quality_df.to_html(index=False)}
+<h2>多ROI统计</h2>{roi_df.to_html(index=False)}
+<h2>径向分箱统计</h2>{radial_df.to_html(index=False)}
+</body></html>
+"""
+
+
 def main() -> None:
     try:
         grids = choose_input_files()
@@ -217,13 +338,35 @@ def main() -> None:
         data=edited_data,
     )
 
-    mode = st.radio("选择可视化模式", ["2D 热力图", "3D 表面图", "剖面图分析", "多文件对比"], horizontal=True)
+    mode = st.radio(
+        "选择可视化模式",
+        ["2D 热力图", "3D 表面图", "剖面图分析", "多文件对比", "时序对比"],
+        horizontal=True,
+    )
     fig = None
     peak_export = pd.DataFrame()
 
     if mode == "2D 热力图":
-        fig = plot_heatmap(cropped_grid, "ROI 热力图")
+        c1, c2 = st.columns(2)
+        with c1:
+            log_scale = st.checkbox("对数色阶(log1p)", value=False)
+        with c2:
+            show_contour = st.checkbox("叠加等高线", value=False)
+        vis_grid = DatGrid(
+            rows=cropped_grid.rows,
+            cols=cropped_grid.cols,
+            hole_value=cropped_grid.hole_value,
+            row_delta=cropped_grid.row_delta,
+            col_delta=cropped_grid.col_delta,
+            row_origin=cropped_grid.row_origin,
+            col_origin=cropped_grid.col_origin,
+            data=apply_visual_transform(cropped_grid.data, log_scale),
+        )
+        fig = plot_heatmap(vis_grid, "ROI 热力图")
         st.plotly_chart(fig, use_container_width=True)
+        if show_contour:
+            contour_levels = st.slider("等高线层数", 5, 50, 20)
+            st.plotly_chart(plot_contour_overlay(vis_grid, contour_levels), use_container_width=True)
     elif mode == "3D 表面图":
         fig = plot_surface(cropped_grid, "ROI 3D 表面")
         st.plotly_chart(fig, use_container_width=True)
@@ -239,16 +382,138 @@ def main() -> None:
             y = extract_profile(cropped_grid.data, axis="y", index=col_idx)
 
         fig, peaks, area = show_profile_analysis(x, y, axis_label=axis.upper())
+        do_fit = st.checkbox("执行高斯拟合", value=True)
+        if do_fit:
+            fit_res = fit_gaussian(x, np.where(np.isfinite(y), y, np.nanmedian(y)))
+            fig.add_trace(go.Scatter(x=x, y=fit_res.fitted_y, mode="lines", name="Gaussian Fit"))
+            st.write(
+                {
+                    "fit_success": fit_res.success,
+                    "amplitude": fit_res.amplitude,
+                    "center": fit_res.center,
+                    "sigma": fit_res.sigma,
+                    "offset": fit_res.offset,
+                }
+            )
         st.plotly_chart(fig, use_container_width=True)
         st.metric("积分面积", f"{area:.6g}" if np.isfinite(area) else "NaN")
         peak_export = pd.DataFrame({"peak_x": peaks.peak_x, "peak_y": peaks.peak_y, "fwhm": peaks.fwhm})
         st.dataframe(peak_export, use_container_width=True)
-    else:
+    elif mode == "多文件对比":
         axis = st.selectbox("对比方向", ["x", "y"])
         max_idx = min(g.rows if axis == "x" else g.cols for g in grids) - 1
         idx = st.slider("剖面索引", 0, max(0, max_idx), min(10, max(0, max_idx)))
         fig = compare_profiles(grids, axis=axis, index=idx)
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        if len(grids) < 2:
+            st.info("时序对比至少需要两个文件（上传多文件即可）。")
+        else:
+            frame = st.slider("帧序号", 0, len(grids) - 1, 0)
+            frame_grid = grids[frame]
+            st.plotly_chart(plot_heatmap(frame_grid, f"Frame {frame + 1}"), use_container_width=True)
+            if frame > 0:
+                prev = grids[frame - 1]
+                diff = frame_grid.data - prev.data
+                diff_grid = DatGrid(
+                    rows=frame_grid.rows,
+                    cols=frame_grid.cols,
+                    hole_value=frame_grid.hole_value,
+                    row_delta=frame_grid.row_delta,
+                    col_delta=frame_grid.col_delta,
+                    row_origin=frame_grid.row_origin,
+                    col_origin=frame_grid.col_origin,
+                    data=diff,
+                )
+                st.plotly_chart(plot_heatmap(diff_grid, "与前一帧差分图"), use_container_width=True)
+
+    st.subheader("数据质量诊断")
+    qr = compute_quality_report(cropped_grid.data)
+    quality_df = pd.DataFrame(
+        [
+            {
+                "nan_ratio": qr.nan_ratio,
+                "zero_ratio": qr.zero_ratio,
+                "saturated_ratio": qr.saturated_ratio,
+                "outlier_ratio": qr.outlier_ratio,
+                "std_dev": qr.std_dev,
+                "mean": qr.mean_val,
+            }
+        ]
+    )
+    st.dataframe(quality_df, use_container_width=True, hide_index=True)
+
+    roi_df = multi_roi_stats(cropped_grid)
+    st.dataframe(roi_df, use_container_width=True, hide_index=True)
+
+    st.subheader("径向分箱统计（支持中心平移）")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        center_row = st.number_input("center_row", value=50.5)
+    with c2:
+        center_col = st.number_input("center_col", value=50.5)
+    with c3:
+        bins = st.slider("分箱数量", 4, 40, 10)
+    use_offset = st.checkbox("先做坐标平移(减去offset)", value=True)
+    if use_offset:
+        o1, o2 = st.columns(2)
+        with o1:
+            offset_row = st.number_input("offset_row", value=1.0)
+        with o2:
+            offset_col = st.number_input("offset_col", value=1.0)
+    else:
+        offset_row = 0.0
+        offset_col = 0.0
+    radial_raw = radial_bin_stats(
+        cropped_grid.data,
+        center_row=center_row,
+        center_col=center_col,
+        offset_row=offset_row,
+        offset_col=offset_col,
+        bins=bins,
+    )
+    radial_df = pd.DataFrame(radial_raw, columns=["r_min", "r_max", "mean", "sum", "count"])
+    st.dataframe(radial_df, use_container_width=True, hide_index=True)
+
+    st.subheader("流程模板（参数保存/加载）")
+    workflow_name = st.text_input("模板名", value="default_workflow")
+    payload = {
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
+        "center_row": center_row,
+        "center_col": center_col,
+        "offset_row": offset_row,
+        "offset_col": offset_col,
+        "bins": bins,
+    }
+    wf_col1, wf_col2 = st.columns(2)
+    with wf_col1:
+        if st.button("保存当前模板"):
+            save_workflow(workflow_name, payload)
+            st.success("模板已保存")
+    with wf_col2:
+        names = get_workflow_names()
+        selected = st.selectbox("加载模板", [""] + names)
+        if selected:
+            st.json(load_workflow(selected))
+
+    st.subheader("批量处理")
+    batch_path = st.text_input("批处理目录（扫描所有 .dat）", value="")
+    batch_df = pd.DataFrame()
+    if batch_path.strip():
+        batch_df = batch_process(batch_path.strip())
+        if batch_df.empty:
+            st.warning("目录不存在或无可处理文件。")
+        else:
+            st.dataframe(batch_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "导出批处理汇总CSV",
+                data=batch_df.to_csv(index=False).encode("utf-8"),
+                file_name="batch_summary.csv",
+                mime="text/csv",
+            )
 
     st.subheader("导出")
     st.download_button(
@@ -280,6 +545,13 @@ def main() -> None:
             )
         except Exception:
             st.caption("导出 PNG 需要安装 kaleido：`pip install kaleido`。")
+    html_report = generate_html_report(quality_df, roi_df, radial_df)
+    st.download_button(
+        "导出分析报告 HTML",
+        data=html_report.encode("utf-8"),
+        file_name="analysis_report.html",
+        mime="text/html",
+    )
 
 
 if __name__ == "__main__":
