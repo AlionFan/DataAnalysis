@@ -8,4 +8,4 @@ kaleido
 openai
 openpyxl
 tabulate
-"httpx[socks]"
+httpx[socks]
