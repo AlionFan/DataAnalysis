@@ -5,3 +5,7 @@ scipy
 plotly
 matplotlib
 kaleido
+openai
+openpyxl
+tabulate
+"httpx[socks]"

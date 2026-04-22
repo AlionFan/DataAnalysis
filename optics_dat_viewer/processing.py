@@ -42,6 +42,19 @@ class QualityReport:
     mean_val: float
 
 
+@dataclass
+class FftResult:
+    frequencies: np.ndarray
+    magnitude: np.ndarray
+    reconstructed: np.ndarray
+
+
+@dataclass
+class Fft2DResult:
+    magnitude: np.ndarray
+    filtered_reconstructed: np.ndarray
+
+
 def smooth_signal(y: np.ndarray, window_length: int, polyorder: int = 2) -> np.ndarray:
     valid = np.where(np.isfinite(y), y, np.nanmedian(y))
     if window_length < 3 or window_length % 2 == 0:
@@ -244,3 +257,112 @@ def radial_bin_stats(
         vals = v[mask]
         out.append([edges[i], edges[i + 1], float(np.mean(vals)), float(np.sum(vals)), int(vals.size)])
     return np.array(out, dtype=float)
+
+
+def fft_analysis_1d(x: np.ndarray, y: np.ndarray, cutoff_ratio: float = 0.2) -> FftResult:
+    signal = np.where(np.isfinite(y), y, np.nanmedian(y)).astype(float)
+    n = len(signal)
+    if n < 2:
+        return FftResult(np.array([]), np.array([]), signal)
+
+    dx = float(np.mean(np.diff(x))) if len(x) > 1 else 1.0
+    spectrum = np.fft.rfft(signal)
+    freqs = np.fft.rfftfreq(n, d=dx if dx != 0 else 1.0)
+    magnitude = np.abs(spectrum)
+
+    cutoff_ratio = min(max(cutoff_ratio, 0.0), 1.0)
+    keep = max(1, int(len(spectrum) * cutoff_ratio))
+    filtered = spectrum.copy()
+    filtered[keep:] = 0
+    reconstructed = np.fft.irfft(filtered, n=n)
+
+    return FftResult(
+        frequencies=freqs,
+        magnitude=magnitude,
+        reconstructed=reconstructed,
+    )
+
+
+def fft2d_filter(
+    matrix: np.ndarray,
+    filter_mode: str = "lowpass",
+    low_ratio: float = 0.1,
+    high_ratio: float = 0.4,
+) -> Fft2DResult:
+    signal = np.where(np.isfinite(matrix), matrix, np.nanmedian(matrix)).astype(float)
+    rows, cols = signal.shape
+    fft2 = np.fft.fftshift(np.fft.fft2(signal))
+    magnitude = np.log1p(np.abs(fft2))
+
+    yy, xx = np.indices((rows, cols))
+    cy, cx = rows // 2, cols // 2
+    radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    max_r = float(radius.max()) if radius.size else 1.0
+    low_r = max_r * min(max(low_ratio, 0.0), 1.0)
+    high_r = max_r * min(max(high_ratio, 0.0), 1.0)
+
+    if filter_mode == "highpass":
+        mask = radius >= low_r
+    elif filter_mode == "bandpass":
+        lo, hi = sorted([low_r, high_r])
+        mask = (radius >= lo) & (radius <= hi)
+    else:
+        mask = radius <= high_r
+
+    filtered = fft2 * mask
+    recon = np.real(np.fft.ifft2(np.fft.ifftshift(filtered)))
+    return Fft2DResult(magnitude=magnitude, filtered_reconstructed=recon)
+
+
+def repair_outlier_point(
+    matrix: np.ndarray,
+    row_idx: int,
+    col_idx: int,
+    method: str = "median_3x3",
+) -> np.ndarray:
+    fixed = matrix.copy()
+    r0 = max(0, row_idx - 1)
+    r1 = min(matrix.shape[0], row_idx + 2)
+    c0 = max(0, col_idx - 1)
+    c1 = min(matrix.shape[1], col_idx + 2)
+    patch = matrix[r0:r1, c0:c1]
+    vals = patch[np.isfinite(patch)]
+    if vals.size == 0:
+        return fixed
+    if method == "mean_3x3":
+        fixed[row_idx, col_idx] = float(np.mean(vals))
+    else:
+        fixed[row_idx, col_idx] = float(np.median(vals))
+    return fixed
+
+
+def fit_multi_gaussian(x: np.ndarray, y: np.ndarray, n_peaks: int = 2) -> tuple[np.ndarray, np.ndarray, bool]:
+    signal = np.where(np.isfinite(y), y, np.nanmedian(y)).astype(float)
+    if curve_fit is None or len(x) < max(8, 3 * n_peaks):
+        return np.array([]), signal, False
+
+    n_peaks = max(1, min(int(n_peaks), 4))
+    peak_idx = np.argsort(signal)[-n_peaks:]
+    peak_idx = np.sort(peak_idx)
+
+    def multi_g(xx, *params):
+        offset = params[-1]
+        out = np.full_like(xx, offset, dtype=float)
+        for i in range(n_peaks):
+            a, c, s = params[3 * i : 3 * i + 3]
+            s = max(abs(s), 1e-9)
+            out += a * np.exp(-0.5 * ((xx - c) / s) ** 2)
+        return out
+
+    p0 = []
+    span = float((x[-1] - x[0]) / 12.0 if x[-1] != x[0] else 1.0)
+    for idx in peak_idx:
+        p0.extend([float(signal[idx]), float(x[idx]), span])
+    p0.append(float(np.min(signal)))
+
+    try:
+        popt, _ = curve_fit(multi_g, x, signal, p0=p0, maxfev=20000)
+        fitted = multi_g(x, *popt)
+        return popt, fitted, True
+    except Exception:
+        return np.array([]), signal, False
