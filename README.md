@@ -74,6 +74,7 @@ optics_dat_viewer/
 ### 1. 安装依赖
 
 ```bash
+conda create -n DataAnalysis python==3.12
 conda activate DataAnalysis
 pip install -r optics_dat_viewer/requirements.txt
 ```
