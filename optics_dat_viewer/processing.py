@@ -336,6 +336,126 @@ def repair_outlier_point(
     return fixed
 
 
+def radius_mean(
+    matrix: np.ndarray,
+    center_row: float,
+    center_col: float,
+    radius: float,
+    mode: str = "euclidean",
+) -> dict:
+    """计算以 (center_row, center_col) 为圆心、半径 r 内的均值。
+
+    Parameters
+    ----------
+    matrix : 2D 数据矩阵
+    center_row, center_col : 圆心（行、列索引，支持小数）
+    radius : 半径
+    mode : "euclidean" — 算术距离 sqrt(Δr² + Δc²) ≤ r
+           "manhattan" — 单元格距离 |Δr| + |Δc| ≤ r（不计算对角线）
+    """
+    rows, cols = matrix.shape
+    rr, cc = np.indices((rows, cols))
+    dr = rr - center_row
+    dc = cc - center_col
+
+    if mode == "manhattan":
+        dist = np.abs(dr) + np.abs(dc)
+    else:
+        dist = np.sqrt(dr ** 2 + dc ** 2)
+
+    mask = dist <= radius
+    valid = np.isfinite(matrix) & mask
+    vals = matrix[valid]
+    dists = dist[valid]
+
+    if vals.size == 0:
+        return {"mean": np.nan, "std": np.nan, "count": 0, "min": np.nan, "max": np.nan}
+
+    return {
+        "mean": float(np.mean(vals)),
+        "std": float(np.std(vals)),
+        "count": int(vals.size),
+        "min": float(np.min(vals)),
+        "max": float(np.max(vals)),
+    }
+
+
+def radius_intensity_curve(
+    matrix: np.ndarray,
+    center_row: float,
+    center_col: float,
+    max_radius: float = 50.0,
+    mode: str = "euclidean",
+    n_points: int = 51,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """计算半径-强度曲线（每个距离壳层/分箱的均值）。
+
+    Parameters
+    ----------
+    matrix : 2D 数据矩阵
+    center_row, center_col : 圆心（行、列索引，支持小数）
+    max_radius : 最大半径
+    mode : "euclidean" — 欧几里得距离 sqrt(Δr² + Δc²)
+           "manhattan" — 曼哈顿距离 |Δr| + |Δc|
+    n_points : 分箱数量
+        曼哈顿模式下默认 51（即半径 0~50 整数），
+        欧几里得模式下按 0.01 为一个单元（即 n_points = int(max_radius / 0.01)）。
+
+    Returns
+    -------
+    radii : 各分箱中心半径
+    means : 各分箱均值强度
+    counts : 各分箱像素数
+    """
+    rows, cols = matrix.shape
+    rr, cc = np.indices((rows, cols))
+    dr = rr - center_row
+    dc = cc - center_col
+
+    if mode == "manhattan":
+        dist = np.abs(dr) + np.abs(dc)
+    else:
+        dist = np.sqrt(dr ** 2 + dc ** 2)
+
+    valid = np.isfinite(matrix)
+    r = dist[valid]
+    v = matrix[valid]
+
+    if r.size == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    if mode == "manhattan":
+        # 曼哈顿距离为整数，直接按整数值分箱：0, 1, 2, ..., max_radius
+        max_r = int(max_radius)
+        radii = np.arange(0, max_r + 1, dtype=float)
+        means = np.full(max_r + 1, np.nan, dtype=float)
+        counts = np.zeros(max_r + 1, dtype=int)
+        r_int = np.round(r).astype(int)
+        for i in range(max_r + 1):
+            mask = r_int == i
+            cnt = int(np.sum(mask))
+            counts[i] = cnt
+            if cnt > 0:
+                means[i] = float(np.mean(v[mask]))
+    else:
+        # 欧几里得距离：均匀分箱
+        edges = np.linspace(0, float(max_radius), n_points + 1)
+        radii = (edges[:-1] + edges[1:]) / 2.0
+        means = np.full(n_points, np.nan, dtype=float)
+        counts = np.zeros(n_points, dtype=int)
+        for i in range(n_points):
+            if i < n_points - 1:
+                mask = (r >= edges[i]) & (r < edges[i + 1])
+            else:
+                mask = (r >= edges[i]) & (r <= edges[i + 1])
+            cnt = int(np.sum(mask))
+            counts[i] = cnt
+            if cnt > 0:
+                means[i] = float(np.mean(v[mask]))
+
+    return radii, means, counts
+
+
 def fit_multi_gaussian(x: np.ndarray, y: np.ndarray, n_peaks: int = 2) -> tuple[np.ndarray, np.ndarray, bool]:
     signal = np.where(np.isfinite(y), y, np.nanmedian(y)).astype(float)
     if curve_fit is None or len(x) < max(8, 3 * n_peaks):

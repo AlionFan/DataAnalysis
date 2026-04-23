@@ -12,11 +12,13 @@ except ImportError:
 
 
 def plot_heatmap(grid: DatGrid, title: str) -> go.Figure:
+    x = np.linspace(-10, 10, grid.cols)
+    y = np.linspace(-10, 10, grid.rows)
     fig = go.Figure(
         data=go.Heatmap(
             z=grid.data,
-            x=grid.x_coords,
-            y=grid.y_coords,
+            x=x,
+            y=y,
             colorscale="Viridis",
             colorbar={"title": "Intensity"},
         )
@@ -25,7 +27,8 @@ def plot_heatmap(grid: DatGrid, title: str) -> go.Figure:
         title=title,
         xaxis_title="X",
         yaxis_title="Y",
-        yaxis={"scaleanchor": "x", "scaleratio": 1},
+        xaxis={"constrain": "range"},
+        yaxis={"scaleanchor": "x", "scaleratio": 1, "constrain": "range"},
     )
     return fig
 
@@ -39,11 +42,13 @@ def plot_surface(grid: DatGrid, title: str) -> go.Figure:
 
 
 def plot_contour_overlay(grid: DatGrid, levels: int) -> go.Figure:
+    x = np.linspace(-10, 10, grid.cols)
+    y = np.linspace(-10, 10, grid.rows)
     fig = go.Figure(
         data=go.Contour(
             z=grid.data,
-            x=grid.x_coords,
-            y=grid.y_coords,
+            x=x,
+            y=y,
             ncontours=levels,
             colorscale="Viridis",
         )

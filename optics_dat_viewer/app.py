@@ -18,6 +18,8 @@ try:
         fit_gaussian,
         fit_multi_gaussian,
         radial_bin_stats,
+        radius_intensity_curve,
+        radius_mean,
         repair_outlier_point,
     )
     from .plots import apply_visual_transform, export_plot_png, plot_contour_overlay, plot_heatmap, plot_surface
@@ -51,6 +53,8 @@ except ImportError:
         fit_gaussian,
         fit_multi_gaussian,
         radial_bin_stats,
+        radius_intensity_curve,
+        radius_mean,
         repair_outlier_point,
     )
     from plots import apply_visual_transform, export_plot_png, plot_contour_overlay, plot_heatmap, plot_surface
@@ -373,7 +377,6 @@ def main() -> None:
     if not grids:
         st.info("请上传或指定至少一个 .dat 文件。")
         return
-    grids = [remap_grid_to_angle(g) for g in grids]
     grid = grids[0]
 
     # ── 2. 侧边栏：导航 + ROI ──
@@ -484,6 +487,104 @@ def main() -> None:
     )
     radial_df = pd.DataFrame(radial_raw, columns=["r_min", "r_max", "mean", "sum", "count"])
     st.dataframe(radial_df, use_container_width=True, hide_index=True)
+
+    # ── 6b. 半径均值计算 ──
+    st.subheader("半径均值计算")
+    st.caption("以指定中心点为原点，半径 r 内求均值。支持两种距离模式：算术距离（欧式）和单元格距离（曼哈顿，不计算对角线）。")
+    rm_c1, rm_c2, rm_c3, rm_c4 = st.columns(4)
+    with rm_c1:
+        rm_center_row = st.number_input("中心行索引", value=float(cropped_grid.rows // 2), min_value=0.0, max_value=float(max(0, cropped_grid.rows - 1)), key="rm_center_row")
+    with rm_c2:
+        rm_center_col = st.number_input("中心列索引", value=float(cropped_grid.cols // 2), min_value=0.0, max_value=float(max(0, cropped_grid.cols - 1)), key="rm_center_col")
+    with rm_c3:
+        rm_radius = st.number_input("半径 r", value=5.0, min_value=0.0, key="rm_radius")
+    with rm_c4:
+        rm_mode = st.selectbox("距离模式", ["euclidean", "manhattan"], format_func=lambda x: "算术距离（欧式）" if x == "euclidean" else "单元格距离（曼哈顿）", key="rm_mode")
+    rm_result = radius_mean(cropped_grid.data, center_row=rm_center_row, center_col=rm_center_col, radius=rm_radius, mode=rm_mode)
+    rm_m1, rm_m2, rm_m3, rm_m4, rm_m5 = st.columns(5)
+    rm_m1.metric("均值", f"{rm_result['mean']:.6g}" if np.isfinite(rm_result["mean"]) else "NaN")
+    rm_m2.metric("标准差", f"{rm_result['std']:.6g}" if np.isfinite(rm_result["std"]) else "NaN")
+    rm_m3.metric("像素数", f"{rm_result['count']}")
+    rm_m4.metric("最小值", f"{rm_result['min']:.6g}" if np.isfinite(rm_result["min"]) else "NaN")
+    rm_m5.metric("最大值", f"{rm_result['max']:.6g}" if np.isfinite(rm_result["max"]) else "NaN")
+
+    # ── 6c. 半径-强度曲线 ──
+    st.subheader("半径-强度曲线")
+    st.caption("以指定中心点为原点，分别用曼哈顿距离和欧几里得距离计算各半径壳层的均值强度，绘制半径-强度曲线。")
+
+    ri_c1, ri_c2 = st.columns(2)
+    with ri_c1:
+        ri_center_row = st.number_input("中心行索引", value=float(cropped_grid.rows // 2), min_value=0.0, max_value=float(max(0, cropped_grid.rows - 1)), key="ri_center_row")
+    with ri_c2:
+        ri_center_col = st.number_input("中心列索引", value=float(cropped_grid.cols // 2), min_value=0.0, max_value=float(max(0, cropped_grid.cols - 1)), key="ri_center_col")
+    ri_max_radius = st.slider("最大半径", 1, 200, 50, key="ri_max_radius")
+
+    # 曼哈顿距离：半径 0~50，51 个整数单位
+    manhattan_radii, manhattan_means, manhattan_counts = radius_intensity_curve(
+        cropped_grid.data,
+        center_row=ri_center_row,
+        center_col=ri_center_col,
+        max_radius=float(ri_max_radius),
+        mode="manhattan",
+        n_points=ri_max_radius + 1,
+    )
+    # 欧几里得距离：计算每个像素的距离和强度，同时按 0.01 分箱求均值
+    rows, cols = cropped_grid.data.shape
+    _rr, _cc = np.indices((rows, cols))
+    _dr = _rr - ri_center_row
+    _dc = _cc - ri_center_col
+    _euc_dist = np.sqrt(_dr ** 2 + _dc ** 2)
+    _valid = np.isfinite(cropped_grid.data)
+    euclidean_point_r = _euc_dist[_valid]
+    euclidean_point_v = cropped_grid.data[_valid]
+
+    euclidean_n_points = int(round(float(ri_max_radius) / 0.01))
+    euclidean_radii, euclidean_means, euclidean_counts = radius_intensity_curve(
+        cropped_grid.data,
+        center_row=ri_center_row,
+        center_col=ri_center_col,
+        max_radius=float(ri_max_radius),
+        mode="euclidean",
+        n_points=euclidean_n_points,
+    )
+
+    ri_tab1, ri_tab2 = st.tabs(["曼哈顿距离（单元格距离）", "欧几里得距离（算术距离）"])
+
+    with ri_tab1:
+        manhattan_fig = go.Figure()
+        manhattan_fig.add_trace(
+            go.Scatter(x=manhattan_radii, y=manhattan_means, mode="lines+markers", name="均值强度",
+                       marker={"size": 4})
+        )
+        manhattan_fig.update_layout(
+            title="曼哈顿距离 半径-强度曲线",
+            xaxis_title="半径（曼哈顿距离）",
+            yaxis_title="均值强度",
+            height=450,
+        )
+        st.plotly_chart(manhattan_fig, use_container_width=True)
+        manhattan_df = pd.DataFrame({"radius": manhattan_radii, "mean_intensity": manhattan_means, "pixel_count": manhattan_counts})
+        st.dataframe(manhattan_df, use_container_width=True, hide_index=True)
+
+    with ri_tab2:
+        euclidean_fig = go.Figure()
+        euclidean_fig.add_trace(
+            go.Scatter(x=euclidean_point_r, y=euclidean_point_v, mode="markers",
+                       name="像素点", marker={"size": 2, "color": "rgba(100,100,200,0.3)"})
+        )
+        euclidean_fig.add_trace(
+            go.Scatter(x=euclidean_radii, y=euclidean_means, mode="lines", name="均值强度",
+                       line={"color": "red", "width": 2})
+        )
+        euclidean_fig.update_layout(
+            title="欧几里得距离 半径-强度曲线",
+            xaxis_title="半径（欧几里得距离）",
+            yaxis_title="强度",
+            height=450,
+        )
+        st.plotly_chart(euclidean_fig, use_container_width=True)
+        euclidean_df = pd.DataFrame({"radius": euclidean_radii, "mean_intensity": euclidean_means, "pixel_count": euclidean_counts})
+        st.dataframe(euclidean_df, use_container_width=True, hide_index=True)
 
     # ── 7. 流程模板 ──
     st.subheader("流程模板（参数保存/加载）")
