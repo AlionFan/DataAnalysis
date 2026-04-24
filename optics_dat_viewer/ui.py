@@ -63,6 +63,18 @@ def remap_grid_to_angle(grid: DatGrid) -> DatGrid:
     )
 
 
+def radial_to_angle_axis(radial_raw: np.ndarray, end_deg: float = 4.0) -> np.ndarray:
+    """将径向分箱结果的 r_min/r_max 从像素单位映射到 0~end_deg 角度。"""
+    result = radial_raw.copy()
+    r_max_val = float(result[:, 1].max()) if result.size > 0 else 1.0
+    if r_max_val == 0:
+        r_max_val = 1.0
+    scale = end_deg / r_max_val
+    result[:, 0] *= scale
+    result[:, 1] *= scale
+    return result
+
+
 def align_curve_by_peak(x: np.ndarray, y: np.ndarray, target_peak_deg: float = 2.0) -> np.ndarray:
     if len(x) == 0:
         return x

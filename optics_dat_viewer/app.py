@@ -28,6 +28,7 @@ try:
         choose_input_files,
         compare_profiles,
         multi_roi_stats,
+        radial_to_angle_axis,
         remap_grid_to_angle,
         show_editable_table,
         show_profile_analysis,
@@ -63,6 +64,7 @@ except ImportError:
         choose_input_files,
         compare_profiles,
         multi_roi_stats,
+        radial_to_angle_axis,
         remap_grid_to_angle,
         show_editable_table,
         show_profile_analysis,
@@ -485,7 +487,16 @@ def main() -> None:
         center_row=center_row, center_col=center_col,
         offset_row=offset_row, offset_col=offset_col, bins=bins,
     )
-    radial_df = pd.DataFrame(radial_raw, columns=["r_min", "r_max", "mean", "sum", "count"])
+
+    use_angle_axis = st.checkbox("横坐标映射到0-4°", value=True)
+    if use_angle_axis and radial_raw.size > 0:
+        radial_display = radial_to_angle_axis(radial_raw, end_deg=4.0)
+        r_col_label = "angle"
+    else:
+        radial_display = radial_raw
+        r_col_label = "r"
+
+    radial_df = pd.DataFrame(radial_display, columns=[f"{r_col_label}_min", f"{r_col_label}_max", "mean", "sum", "count"])
     st.dataframe(radial_df, use_container_width=True, hide_index=True)
 
     # ── 6b. 半径均值计算 ──
@@ -518,6 +529,11 @@ def main() -> None:
     with ri_c2:
         ri_center_col = st.number_input("中心列索引", value=float(cropped_grid.cols // 2), min_value=0.0, max_value=float(max(0, cropped_grid.cols - 1)), key="ri_center_col")
     ri_max_radius = st.slider("最大半径", 1, 200, 50, key="ri_max_radius")
+    ri_bin_step = st.number_input("欧几里得分箱步长", value=0.01, min_value=0.001, step=0.001, format="%.3f", key="ri_bin_step")
+    ri_use_angle = st.checkbox("横坐标映射到0-4°", value=True, key="ri_use_angle")
+    ri_scale = 4.0 / float(ri_max_radius) if ri_use_angle else 1.0
+    ri_x_label_manhattan = "角度（度）" if ri_use_angle else "半径（曼哈顿距离）"
+    ri_x_label_euclidean = "角度（度）" if ri_use_angle else "半径（欧几里得距离）"
 
     # 曼哈顿距离：半径 0~50，51 个整数单位
     manhattan_radii, manhattan_means, manhattan_counts = radius_intensity_curve(
@@ -535,10 +551,11 @@ def main() -> None:
     _dc = _cc - ri_center_col
     _euc_dist = np.sqrt(_dr ** 2 + _dc ** 2)
     _valid = np.isfinite(cropped_grid.data)
-    euclidean_point_r = _euc_dist[_valid]
-    euclidean_point_v = cropped_grid.data[_valid]
+    _in_range = _euc_dist <= float(ri_max_radius)
+    euclidean_point_r = _euc_dist[_valid & _in_range]
+    euclidean_point_v = cropped_grid.data[_valid & _in_range]
 
-    euclidean_n_points = int(round(float(ri_max_radius) / 0.01))
+    euclidean_n_points = int(round(float(ri_max_radius) / ri_bin_step))
     euclidean_radii, euclidean_means, euclidean_counts = radius_intensity_curve(
         cropped_grid.data,
         center_row=ri_center_row,
@@ -553,38 +570,39 @@ def main() -> None:
     with ri_tab1:
         manhattan_fig = go.Figure()
         manhattan_fig.add_trace(
-            go.Scatter(x=manhattan_radii, y=manhattan_means, mode="lines+markers", name="均值强度",
+            go.Scatter(x=manhattan_radii * ri_scale, y=manhattan_means, mode="lines+markers", name="均值强度",
                        marker={"size": 4})
         )
         manhattan_fig.update_layout(
             title="曼哈顿距离 半径-强度曲线",
-            xaxis_title="半径（曼哈顿距离）",
+            xaxis_title=ri_x_label_manhattan,
             yaxis_title="均值强度",
             height=450,
         )
         st.plotly_chart(manhattan_fig, use_container_width=True)
-        manhattan_df = pd.DataFrame({"radius": manhattan_radii, "mean_intensity": manhattan_means, "pixel_count": manhattan_counts})
+        manhattan_df = pd.DataFrame({"radius": manhattan_radii * ri_scale, "mean_intensity": manhattan_means, "pixel_count": manhattan_counts})
         st.dataframe(manhattan_df, use_container_width=True, hide_index=True)
 
     with ri_tab2:
         euclidean_fig = go.Figure()
         euclidean_fig.add_trace(
-            go.Scatter(x=euclidean_point_r, y=euclidean_point_v, mode="markers",
+            go.Scatter(x=euclidean_point_r * ri_scale, y=euclidean_point_v, mode="markers",
                        name="像素点", marker={"size": 2, "color": "rgba(100,100,200,0.3)"})
         )
         euclidean_fig.add_trace(
-            go.Scatter(x=euclidean_radii, y=euclidean_means, mode="lines", name="均值强度",
+            go.Scatter(x=euclidean_radii * ri_scale, y=euclidean_means, mode="lines", name="均值强度",
                        line={"color": "red", "width": 2})
         )
         euclidean_fig.update_layout(
             title="欧几里得距离 半径-强度曲线",
-            xaxis_title="半径（欧几里得距离）",
+            xaxis_title=ri_x_label_euclidean,
             yaxis_title="强度",
             height=450,
         )
         st.plotly_chart(euclidean_fig, use_container_width=True)
-        euclidean_df = pd.DataFrame({"radius": euclidean_radii, "mean_intensity": euclidean_means, "pixel_count": euclidean_counts})
+        euclidean_df = pd.DataFrame({"radius": euclidean_radii * ri_scale, "mean_intensity": euclidean_means, "pixel_count": euclidean_counts})
         st.dataframe(euclidean_df, use_container_width=True, hide_index=True)
+
 
     # ── 7. 流程模板 ──
     st.subheader("流程模板（参数保存/加载）")
