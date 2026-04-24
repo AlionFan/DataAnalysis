@@ -146,10 +146,10 @@ def _render_surface_mode(cropped_grid: DatGrid) -> go.Figure:
     return fig
 
 
-def _render_profile_mode(cropped_grid: DatGrid) -> tuple[go.Figure, pd.DataFrame]:
+def _render_profile_mode(cropped_grid: DatGrid, angle_start_deg: float = 0.0, angle_end_deg: float = 4.0) -> tuple[go.Figure, pd.DataFrame]:
     axis = st.selectbox("剖面方向", ["x", "y"])
     do_align = st.checkbox("按峰位对齐", value=False)
-    target_peak_deg = st.slider("对齐目标角度(°)", 0.0, 4.0, 2.0, 0.05) if do_align else 2.0
+    target_peak_deg = st.slider("对齐目标角度(°)", angle_start_deg, angle_end_deg, (angle_start_deg + angle_end_deg) / 2, 0.05) if do_align else (angle_start_deg + angle_end_deg) / 2
     if axis == "x":
         row_idx = st.slider("选择行索引", 0, max(0, cropped_grid.rows - 1), min(10, max(0, cropped_grid.rows - 1)))
         x = cropped_grid.x_coords
@@ -158,7 +158,7 @@ def _render_profile_mode(cropped_grid: DatGrid) -> tuple[go.Figure, pd.DataFrame
         col_idx = st.slider("选择列索引", 0, max(0, cropped_grid.cols - 1), min(10, max(0, cropped_grid.cols - 1)))
         x = cropped_grid.y_coords
         y = extract_profile(cropped_grid.data, axis="y", index=col_idx)
-    x = to_angle_axis(len(y), 0.0, 4.0)
+    x = to_angle_axis(len(y), angle_start_deg, angle_end_deg)
     if do_align:
         x = align_curve_by_peak(x, y, target_peak_deg=target_peak_deg)
 
@@ -213,13 +213,13 @@ def _render_profile_mode(cropped_grid: DatGrid) -> tuple[go.Figure, pd.DataFrame
     return fig, peak_export
 
 
-def _render_compare_mode(grids: list[DatGrid]) -> go.Figure:
+def _render_compare_mode(grids: list[DatGrid], angle_start_deg: float = 0.0, angle_end_deg: float = 4.0) -> go.Figure:
     axis = st.selectbox("对比方向", ["x", "y"])
     align_cmp = st.checkbox("对比曲线按峰位对齐", value=True)
-    align_target_cmp = st.slider("对比对齐目标角度(°)", 0.0, 4.0, 2.0, 0.05) if align_cmp else 2.0
+    align_target_cmp = st.slider("对比对齐目标角度(°)", angle_start_deg, angle_end_deg, (angle_start_deg + angle_end_deg) / 2, 0.05) if align_cmp else (angle_start_deg + angle_end_deg) / 2
     max_idx = min(g.rows if axis == "x" else g.cols for g in grids) - 1
     idx = st.slider("剖面索引", 0, max(0, max_idx), min(10, max(0, max_idx)))
-    fig = compare_profiles(grids, axis=axis, index=idx, use_angle_axis=True, do_align=align_cmp, target_peak_deg=align_target_cmp)
+    fig = compare_profiles(grids, axis=axis, index=idx, use_angle_axis=True, do_align=align_cmp, target_peak_deg=align_target_cmp, angle_start_deg=angle_start_deg, angle_end_deg=angle_end_deg)
     st.plotly_chart(fig, use_container_width=True)
     return fig
 
@@ -244,7 +244,7 @@ def _render_timeseries_mode(grids: list[DatGrid]) -> go.Figure | None:
     return fig
 
 
-def _render_overview_page(cropped_grid: DatGrid, grids: list[DatGrid]) -> tuple[go.Figure | None, pd.DataFrame]:
+def _render_overview_page(cropped_grid: DatGrid, grids: list[DatGrid], angle_start_deg: float = 0.0, angle_end_deg: float = 4.0) -> tuple[go.Figure | None, pd.DataFrame]:
     """综合分析：选择可视化模式并渲染"""
     mode = st.radio(
         "选择可视化模式",
@@ -256,9 +256,9 @@ def _render_overview_page(cropped_grid: DatGrid, grids: list[DatGrid]) -> tuple[
     elif mode == "3D 表面图":
         return _render_surface_mode(cropped_grid), pd.DataFrame()
     elif mode == "剖面图分析":
-        return _render_profile_mode(cropped_grid)
+        return _render_profile_mode(cropped_grid, angle_start_deg=angle_start_deg, angle_end_deg=angle_end_deg)
     elif mode == "多文件对比":
-        return _render_compare_mode(grids), pd.DataFrame()
+        return _render_compare_mode(grids, angle_start_deg=angle_start_deg, angle_end_deg=angle_end_deg), pd.DataFrame()
     else:
         return _render_timeseries_mode(grids), pd.DataFrame()
 
@@ -388,6 +388,12 @@ def main() -> None:
         ["综合分析", "频域分析(2D FFT)", "AI大模型分析"],
         index=0,
     )
+    st.sidebar.header("角度映射范围")
+    angle_c1, angle_c2 = st.sidebar.columns(2)
+    with angle_c1:
+        angle_start_deg = st.number_input("起始角度(°)", value=0.0, step=0.1, key="angle_start_deg")
+    with angle_c2:
+        angle_end_deg = st.number_input("终止角度(°)", value=4.0, min_value=angle_start_deg + 0.01, step=0.1, key="angle_end_deg")
     st.sidebar.header("ROI 选择")
     x_min, x_max = st.sidebar.slider(
         "X 范围", float(grid.x_coords[0]), float(grid.x_coords[-1]),
@@ -423,7 +429,7 @@ def main() -> None:
     fig = None
     peak_export = pd.DataFrame()
     if nav == "综合分析":
-        fig, peak_export = _render_overview_page(cropped_grid, grids)
+        fig, peak_export = _render_overview_page(cropped_grid, grids, angle_start_deg=angle_start_deg, angle_end_deg=angle_end_deg)
     elif nav == "频域分析(2D FFT)":
         _render_fft_page(cropped_grid)
 
@@ -488,9 +494,9 @@ def main() -> None:
         offset_row=offset_row, offset_col=offset_col, bins=bins,
     )
 
-    use_angle_axis = st.checkbox("横坐标映射到0-4°", value=True)
+    use_angle_axis = st.checkbox(f"横坐标映射到{angle_start_deg}-{angle_end_deg}°", value=True)
     if use_angle_axis and radial_raw.size > 0:
-        radial_display = radial_to_angle_axis(radial_raw, end_deg=4.0)
+        radial_display = radial_to_angle_axis(radial_raw, start_deg=angle_start_deg, end_deg=angle_end_deg)
         r_col_label = "angle"
     else:
         radial_display = radial_raw
@@ -530,8 +536,9 @@ def main() -> None:
         ri_center_col = st.number_input("中心列索引", value=float(cropped_grid.cols // 2), min_value=0.0, max_value=float(max(0, cropped_grid.cols - 1)), key="ri_center_col")
     ri_max_radius = st.slider("最大半径", 1, 200, 50, key="ri_max_radius")
     ri_bin_step = st.number_input("欧几里得分箱步长", value=0.01, min_value=0.001, step=0.001, format="%.3f", key="ri_bin_step")
-    ri_use_angle = st.checkbox("横坐标映射到0-4°", value=True, key="ri_use_angle")
-    ri_scale = 4.0 / float(ri_max_radius) if ri_use_angle else 1.0
+    ri_use_angle = st.checkbox(f"横坐标映射到{angle_start_deg}-{angle_end_deg}°", value=True, key="ri_use_angle")
+    ri_scale = (angle_end_deg - angle_start_deg) / float(ri_max_radius) if ri_use_angle else 1.0
+    ri_offset = angle_start_deg if ri_use_angle else 0.0
     ri_x_label_manhattan = "角度（度）" if ri_use_angle else "半径（曼哈顿距离）"
     ri_x_label_euclidean = "角度（度）" if ri_use_angle else "半径（欧几里得距离）"
 
@@ -570,7 +577,7 @@ def main() -> None:
     with ri_tab1:
         manhattan_fig = go.Figure()
         manhattan_fig.add_trace(
-            go.Scatter(x=manhattan_radii * ri_scale, y=manhattan_means, mode="lines+markers", name="均值强度",
+            go.Scatter(x=manhattan_radii * ri_scale + ri_offset, y=manhattan_means, mode="lines+markers", name="均值强度",
                        marker={"size": 4})
         )
         manhattan_fig.update_layout(
@@ -580,17 +587,17 @@ def main() -> None:
             height=450,
         )
         st.plotly_chart(manhattan_fig, use_container_width=True)
-        manhattan_df = pd.DataFrame({"radius": manhattan_radii * ri_scale, "mean_intensity": manhattan_means, "pixel_count": manhattan_counts})
+        manhattan_df = pd.DataFrame({"radius": manhattan_radii * ri_scale + ri_offset, "mean_intensity": manhattan_means, "pixel_count": manhattan_counts})
         st.dataframe(manhattan_df, use_container_width=True, hide_index=True)
 
     with ri_tab2:
         euclidean_fig = go.Figure()
         euclidean_fig.add_trace(
-            go.Scatter(x=euclidean_point_r * ri_scale, y=euclidean_point_v, mode="markers",
+            go.Scatter(x=euclidean_point_r * ri_scale + ri_offset, y=euclidean_point_v, mode="markers",
                        name="像素点", marker={"size": 2, "color": "rgba(100,100,200,0.3)"})
         )
         euclidean_fig.add_trace(
-            go.Scatter(x=euclidean_radii * ri_scale, y=euclidean_means, mode="lines", name="均值强度",
+            go.Scatter(x=euclidean_radii * ri_scale + ri_offset, y=euclidean_means, mode="lines", name="均值强度",
                        line={"color": "red", "width": 2})
         )
         euclidean_fig.update_layout(
@@ -600,7 +607,7 @@ def main() -> None:
             height=450,
         )
         st.plotly_chart(euclidean_fig, use_container_width=True)
-        euclidean_df = pd.DataFrame({"radius": euclidean_radii * ri_scale, "mean_intensity": euclidean_means, "pixel_count": euclidean_counts})
+        euclidean_df = pd.DataFrame({"radius": euclidean_radii * ri_scale + ri_offset, "mean_intensity": euclidean_means, "pixel_count": euclidean_counts})
         st.dataframe(euclidean_df, use_container_width=True, hide_index=True)
 
 
@@ -611,6 +618,7 @@ def main() -> None:
         "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
         "center_row": center_row, "center_col": center_col,
         "offset_row": offset_row, "offset_col": offset_col, "bins": bins,
+        "angle_start_deg": angle_start_deg, "angle_end_deg": angle_end_deg,
     }
     wf_col1, wf_col2 = st.columns(2)
     with wf_col1:

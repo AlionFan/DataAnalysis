@@ -48,30 +48,30 @@ def to_angle_axis(length: int, start_deg: float = 0.0, end_deg: float = 4.0) -> 
     return np.linspace(start_deg, end_deg, length)
 
 
-def remap_grid_to_angle(grid: DatGrid) -> DatGrid:
-    col_delta = 4.0 / max(1, grid.cols - 1)
-    row_delta = 4.0 / max(1, grid.rows - 1)
+def remap_grid_to_angle(grid: DatGrid, start_deg: float = 0.0, end_deg: float = 4.0) -> DatGrid:
+    col_delta = (end_deg - start_deg) / max(1, grid.cols - 1)
+    row_delta = (end_deg - start_deg) / max(1, grid.rows - 1)
     return DatGrid(
         rows=grid.rows,
         cols=grid.cols,
         hole_value=grid.hole_value,
         row_delta=row_delta,
         col_delta=col_delta,
-        row_origin=0.0,
-        col_origin=0.0,
+        row_origin=start_deg,
+        col_origin=start_deg,
         data=grid.data,
     )
 
 
-def radial_to_angle_axis(radial_raw: np.ndarray, end_deg: float = 4.0) -> np.ndarray:
-    """将径向分箱结果的 r_min/r_max 从像素单位映射到 0~end_deg 角度。"""
+def radial_to_angle_axis(radial_raw: np.ndarray, start_deg: float = 0.0, end_deg: float = 4.0) -> np.ndarray:
+    """将径向分箱结果的 r_min/r_max 从像素单位映射到 start_deg~end_deg 角度。"""
     result = radial_raw.copy()
     r_max_val = float(result[:, 1].max()) if result.size > 0 else 1.0
     if r_max_val == 0:
         r_max_val = 1.0
-    scale = end_deg / r_max_val
-    result[:, 0] *= scale
-    result[:, 1] *= scale
+    scale = (end_deg - start_deg) / r_max_val
+    result[:, 0] = result[:, 0] * scale + start_deg
+    result[:, 1] = result[:, 1] * scale + start_deg
     return result
 
 
@@ -183,6 +183,8 @@ def compare_profiles(
     use_angle_axis: bool = True,
     do_align: bool = False,
     target_peak_deg: float = 2.0,
+    angle_start_deg: float = 0.0,
+    angle_end_deg: float = 4.0,
 ) -> go.Figure:
     fig = go.Figure()
     for idx, grid in enumerate(grids):
@@ -196,7 +198,7 @@ def compare_profiles(
             label = f"File {idx + 1} - col {min(index, grid.cols - 1)}"
         y = normalize_minmax(np.where(np.isfinite(y), y, 0.0))
         if use_angle_axis:
-            x = to_angle_axis(len(y), 0.0, 4.0)
+            x = to_angle_axis(len(y), angle_start_deg, angle_end_deg)
         if do_align:
             x = align_curve_by_peak(x, y, target_peak_deg=target_peak_deg)
         fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=label))
