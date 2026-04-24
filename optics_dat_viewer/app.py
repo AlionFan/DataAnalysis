@@ -100,8 +100,12 @@ def _render_heatmap_mode(cropped_grid: DatGrid) -> go.Figure:
     a1, a2, a3, a4 = st.columns(4)
     with a1:
         ann_x = st.number_input("标注X", value=float(cropped_grid.x_coords[0]))
+        if ann_x is None:
+            ann_x = float(cropped_grid.x_coords[0])
     with a2:
         ann_y = st.number_input("标注Y", value=float(cropped_grid.y_coords[0]))
+        if ann_y is None:
+            ann_y = float(cropped_grid.y_coords[0])
     with a3:
         ann_text = st.text_input("标注文本", value="")
     with a4:
@@ -392,8 +396,12 @@ def main() -> None:
     angle_c1, angle_c2 = st.sidebar.columns(2)
     with angle_c1:
         angle_start_deg = st.number_input("起始角度(°)", value=0.0, step=0.1, key="angle_start_deg")
+        if angle_start_deg is None:
+            angle_start_deg = 0.0
     with angle_c2:
         angle_end_deg = st.number_input("终止角度(°)", value=4.0, min_value=angle_start_deg + 0.01, step=0.1, key="angle_end_deg")
+        if angle_end_deg is None:
+            angle_end_deg = 4.0
     st.sidebar.header("ROI 选择")
     x_min, x_max = st.sidebar.slider(
         "X 范围", float(grid.x_coords[0]), float(grid.x_coords[-1]),
@@ -474,8 +482,12 @@ def main() -> None:
     c1, c2, c3 = st.columns(3)
     with c1:
         center_row = st.number_input("center_row", value=50.5)
+        if center_row is None:
+            center_row = 50.5
     with c2:
         center_col = st.number_input("center_col", value=50.5)
+        if center_col is None:
+            center_col = 50.5
     with c3:
         bins = st.slider("分箱数量", 4, 40, 10)
     use_offset = st.checkbox("先做坐标平移(减去offset)", value=True)
@@ -483,8 +495,12 @@ def main() -> None:
         o1, o2 = st.columns(2)
         with o1:
             offset_row = st.number_input("offset_row", value=1.0)
+            if offset_row is None:
+                offset_row = 1.0
         with o2:
             offset_col = st.number_input("offset_col", value=1.0)
+            if offset_col is None:
+                offset_col = 1.0
     else:
         offset_row = 0.0
         offset_col = 0.0
